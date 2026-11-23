@@ -94,6 +94,7 @@ AGENT_ENABLED=false
 AGENT_MAX_SEARCH_CALLS=3
 AGENT_MAX_RETRIES=1
 AGENT_MAX_LLM_CALLS=4
+AGENT_DEMO_OVERRIDE_ENABLED=false
 ```
 
 `OLLAMA_THINK` передаётся верхнеуровневым полем `/api/chat`, а остальные два значения —
@@ -109,6 +110,12 @@ Ollama на GPU.
 Bounded LangGraph agent также выключен по умолчанию. Он использует тот же локальный
 Qwen и существующий hybrid retrieval; лимиты search/retry/LLM применяются при каждом
 исполнении. Отдельные внешние API и shared memory не используются.
+
+Для воспроизводимой локальной демонстрации trajectory можно оставить
+`AGENT_ENABLED=false`, установить `AGENT_DEMO_OVERRIDE_ENABLED=true` и перезапустить
+backend. В браузере появится выбор режима для конкретного запроса. Флаг нельзя включать
+на публично доступном интерфейсе: в MVP нет аутентификации, а override предназначен
+только для loopback-демо и не меняет глобальную настройку сервера.
 
 ### Диагностика TLS timeout
 

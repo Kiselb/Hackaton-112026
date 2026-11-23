@@ -17,6 +17,8 @@
   BGE CrossEncoder reranker.
 - **Stores:** Postgres relational source of truth; Qdrant and OpenSearch are rebuildable derived indexes; file storage is filesystem adapter.
 - **Observability:** structured node decisions, retrieval details, token counters, response latency, outcomes; DB for MVP, OTel/MLflow/Langfuse later.
+- **Analytics UI:** deterministic overlapping outcome labels over `SearchTrace`, bounded
+  list/detail APIs and trace-linked feedback. No LLM judge is required.
 
 ## Ingestion
 
@@ -67,6 +69,32 @@ LLM calls by default. The only graph loop is
 `assess_evidence -> targeted_retrieve -> assess_evidence`; retry/search budgets and
 LangGraph recursion limit make it finite. State is request-local and is not long-term or
 shared memory.
+
+## Search analytics and feedback
+
+`SearchTrace.status` is the technical execution status only. CLIP-007 derives separate,
+overlapping categories (`technical_error`, `no_evidence`, `evidence_gap`,
+`justified_abstention`, `citation_problem`, `agent_fallback`,
+`manual_review_required`, `answer_produced`) from persisted counters and structured
+details. This classification is deterministic and does not claim semantic correctness;
+without a verified signal answer correctness is `not_measured` and a normal answer's
+quality status is `unknown`.
+
+`trace_feedback` stores a rating, trace ID and the trace's user/session identity. The API
+requires both identities to match before insertion. Feedback is analysis material only and
+never becomes document evidence or a corporate fact. The additive table is created by the
+existing `Base.metadata.create_all` startup path; existing tables and indexes are not
+rewritten.
+
+The list API caps pages at 100 rows and supports status, mode, outcome, identity and time
+filters. Detail reconstruction resolves only the recorded `source_ids` through PostgreSQL,
+preserves their citation order and returns page only when it is stored. Raw exception text
+is retained in PostgreSQL but redacted from the frontend projection.
+
+`AGENT_DEMO_OVERRIDE_ENABLED=false` is the safe default. When explicitly enabled on a
+loopback-only local demo, `/api/v1/ask` accepts a request-level baseline/agent choice; it
+does not mutate global settings. The response and trace always expose the actual mode, so
+an agent exception followed by baseline fallback is displayed as baseline.
 
 ## Document temporality and contradiction
 

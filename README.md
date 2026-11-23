@@ -19,7 +19,8 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - локальный ответ Ollama с numbered sources и проверкой номеров цитат;
 - traces, timings и token counts в PostgreSQL;
 - деактивация и восстановление документов;
-- React UI поиска, источников и административного реестра;
+- React UI поиска, кликабельных источников, feedback и административной аналитики;
+- пагинируемый журнал запросов и viewer фактических LangGraph-траекторий;
 - воспроизводимый smoke-test upload → ask → deactivate → ask → restore → ask.
 
 Bounded LangGraph agent и CrossEncoder reranker реализованы за независимыми флагами
@@ -67,6 +68,11 @@ Agent настраивается через `AGENT_ENABLED`, `AGENT_MAX_SEARCH_C
 `AGENT_MAX_RETRIES` и `AGENT_MAX_LLM_CALLS`. Defaults: `false`, 3, 1 и 4.
 При исключении agent runtime запрос контролируемо выполняется существующим RAG,
 а причина fallback сохраняется в trace.
+
+Для локальной браузерной демонстрации можно отдельно установить
+`AGENT_DEMO_OVERRIDE_ENABLED=true`. Тогда UI показывает request-level выбор режима;
+глобальный `AGENT_ENABLED=false` при этом сохраняется. По умолчанию override выключен,
+не меняет серверную настройку и допустим только на loopback в этом MVP без аутентификации.
 
 Backend:
 
@@ -151,8 +157,16 @@ Smoke следует запускать на свежих проектных р�
 - `POST /api/v1/documents/{id}/deactivate`;
 - `POST /api/v1/documents/{id}/restore`;
 - `POST /api/v1/ask`;
-- `GET /api/v1/admin/analytics`;
-- `GET /api/v1/admin/traces`.
+- `GET /api/v1/capabilities` — доступность локального demo override;
+- `GET /api/v1/admin/analytics` — агрегаты, mode share, latency/tokens и динамика;
+- `GET /api/v1/admin/traces` — фильтруемый список с `limit`/`offset`;
+- `GET /api/v1/admin/traces/{id}` — ответ, evidence и безопасная проекция trajectory;
+- `POST /api/v1/traces/{id}/feedback` — оценка ответа владельцем trace.
+
+`status=ok` означает только техническое завершение. Dashboard не выдаёт его за
+правильность ответа: без gold/expert signal поле корректности остаётся `not_measured`,
+а обычный сформированный ответ получает quality status `unknown`. Схема классификации и
+API описаны в [docs/reports/CLIP007_ANALYTICS.md](docs/reports/CLIP007_ANALYTICS.md).
 
 OpenAPI: `http://127.0.0.1:8000/docs`.
 
@@ -172,6 +186,7 @@ registry. Для `/api/chat` приложение отправляет конф�
 
 - нет OCR, распознавания таблиц и сканов;
 - нет аутентификации, ACL и production security;
+- административные traces доступны глобально в локальном MVP; фильтры не являются ACL;
 - нет очереди ingestion и автоматической reconciliation между тремя хранилищами;
 - evidence assessment и проверка номера цитаты не заменяют экспертную entailment-проверку;
 - baseline измерен на синтетических документах и не является оценкой качества на

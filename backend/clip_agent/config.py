@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     agent_max_search_calls: int = Field(default=3, ge=1, le=10)
     agent_max_retries: int = Field(default=1, ge=0, le=3)
     agent_max_llm_calls: int = Field(default=4, ge=1, le=10)
+    agent_demo_override_enabled: bool = False
     storage_root: Path = Path("storage")
     frontend_origin: str = "http://127.0.0.1:5173"
 

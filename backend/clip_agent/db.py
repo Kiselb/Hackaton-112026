@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine
@@ -12,6 +12,10 @@ class Base(DeclarativeBase):
     pass
 
 
+def utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 class Document(Base):
     __tablename__ = "documents"
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -20,7 +24,7 @@ class Document(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="indexing", index=True)
     storage_key: Mapped[str] = mapped_column(String(1000))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     chunks: Mapped[list["Chunk"]] = relationship(cascade="all, delete-orphan")
 
 
@@ -50,7 +54,17 @@ class SearchTrace(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="started")
     details: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TraceFeedback(Base):
+    __tablename__ = "trace_feedback"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    trace_id: Mapped[UUID] = mapped_column(ForeignKey("search_traces.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(200))
+    session_id: Mapped[str] = mapped_column(String(200))
+    rating: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 engine = create_engine(get_settings().postgres_dsn, pool_pre_ping=True)

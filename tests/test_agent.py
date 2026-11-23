@@ -340,5 +340,6 @@ def test_agent_exception_falls_back_to_existing_rag(monkeypatch):
 
     assert result["answer"] == "Baseline answer [1]."
     assert result["metrics"]["agent_enabled"] is False
-    assert result["metrics"]["agent_fallback_reason"] == "agent failed"
+    assert result["metrics"]["agent_fallback_reason"] == "agent_runtime_error"
     assert db.trace.details["mode"] == "baseline"
+    assert db.trace.details["agent_fallback_reason"] == "agent failed"
