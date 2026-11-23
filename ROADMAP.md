@@ -1,5 +1,12 @@
 # Evolution roadmap · ordered for a short hackathon
 
+## Завершено
+
+- CLIP-001: локальный hybrid RAG MVP.
+- CLIP-002: Qwen baseline, traces и document lifecycle.
+- CLIP-003: Evaluation Lab, corporate/v1 (18 сценариев), изолированный corpus,
+  детерминированные retrieval/answer checks, отчёты и сравнение прогонов.
+
 ## P0 — before accepting organizer data
 
 - Verify Python 3.12 environment, Docker ports and Ollama GPU access; prefetch all models.
@@ -12,7 +19,8 @@
 - Confirm format distribution, whether DOCX tables and scanned PDFs matter, document metadata and actual evaluation method.
 - Add OCR/table parsing **only if corpus needs it**; do not spend time on hypothetical complexities.
 - Add source-side clause/section IDs only if actual documents contain dependable structure.
-- Create 15–25 hand-checked evaluation questions and latency logs. Use `docs/EVALUATION.md`.
+- Расширять corporate/v1 только новой версией датасета; baseline из 18 вручную
+  сверенных вопросов и latency/token logs зафиксирован в CLIP-003.
 - Improve query decomposition / multi-document coverage; assess omissions and contradictions.
 - Rehearse an uncut 3-minute recording with warm models and real corpus. Freeze SHA for submission.
 
@@ -22,7 +30,8 @@
 - Source-backed shared verified memory with approval/expiry and source checks.
 - Retrieval ACL demo (synthetic groups) *if other high-priority criteria already pass*.
 - One dashboard view of missing product/license information and frequently unsuccessful queries.
-- Export experiment reports by git commit, corpus snapshot and model config.
+- Экспорт experiment reports по commit, corpus hash и model config реализован в
+  CLIP-003; сохранять совместимость формата при MultiQuery/reranking.
 
 ## P3 — after hackathon / before deployment
 

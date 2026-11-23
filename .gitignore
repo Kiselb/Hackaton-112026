@@ -10,3 +10,5 @@ node_modules/
 frontend/dist/
 storage/
 smoke-results*.json
+eval/results/
+eval/runtime/

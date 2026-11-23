@@ -87,6 +87,24 @@ Set-Location ..
 .\.venv\Scripts\python.exe scripts\smoke_test.py --model qwen3.5:9b --output smoke-results-qwen.json
 ```
 
+## Evaluation Lab (CLIP-003)
+
+Воспроизводимый baseline на 18 вручную сверенных сценариях запускается без отдельного
+backend-процесса:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v1.jsonl
+```
+
+Runner использует отдельные PostgreSQL schema, Qdrant collection, OpenSearch index и
+storage, проверяет SHA-256 корпуса и не меняет пользовательские индексы. Он сохраняет
+run.json, cases.jsonl и report.md в исключённом из Git каталоге eval/results/.
+Сравнение двух прогонов: scripts/evaluate.py --compare RUN_A RUN_B.
+
+Методика: [docs/EVALUATION_LAB.md](docs/EVALUATION_LAB.md). Протокол:
+[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md). Фактический baseline:
+[docs/reports/CLIP003_BASELINE.md](docs/reports/CLIP003_BASELINE.md).
+
 Smoke следует запускать на свежих проектных ресурсах: повторный запуск загружает новые
 документы. Он проверяет retrieval, LLM, citations, traces, деактивацию и восстановление,
 а также сохраняет реальные timings и resource snapshots.
