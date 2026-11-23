@@ -206,6 +206,9 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "input_tokens": metrics.get("prompt_tokens"),
             "output_tokens": metrics.get("completion_tokens"),
             "rerank_latency_ms": metrics.get("rerank_latency_ms"),
+            "agent_search_calls": metrics.get("agent_search_calls", 1),
+            "agent_llm_calls": metrics.get("agent_llm_calls", 1),
+            "agent_steps": metrics.get("agent_steps"),
         },
         "manual_review_required": manual_review_required,
         "manual_review_reason": (
@@ -288,6 +291,13 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             "input_mean": _mean(values("input_tokens")),
             "output_mean": _mean(values("output_tokens")),
         },
+        "agent_calls": {
+            "search_total": sum(values("agent_search_calls")),
+            "search_mean": _mean(values("agent_search_calls")),
+            "llm_total": sum(values("agent_llm_calls")),
+            "llm_mean": _mean(values("agent_llm_calls")),
+            "steps_mean": _mean(values("agent_steps")),
+        },
     }
 
 
@@ -325,6 +335,14 @@ def compare_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
         "right": after,
         "delta": round(after - before, 4) if before is not None and after is not None else None,
     }
+    for key in ("search_mean", "llm_mean", "steps_mean"):
+        before = left_summary.get("agent_calls", {}).get(key)
+        after = right_summary.get("agent_calls", {}).get(key)
+        metrics[f"agent_{key}"] = {
+            "left": before,
+            "right": after,
+            "delta": round(after - before, 4) if before is not None and after is not None else None,
+        }
     return {
         "left_experiment_id": left["experiment_id"],
         "right_experiment_id": right["experiment_id"],

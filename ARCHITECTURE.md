@@ -33,19 +33,18 @@ Important: a revised regulation is *technical lineage*; replacing a particular b
 ## Search / answer
 
 ```text
-question + user session history
-    -> LLM query plan (original query always preserved)
-    -> local BGE-M3 embedding
-    -> Qdrant dense top-50 + OpenSearch BM25 top-50 per query
-    -> RRF, candidate cap 24
-    -> SQL visibility: status=ready, active=true
-    -> optional local CrossEncoder rerank of active search chunks
-    -> distinct parents, up to 8, approximate 5000-token budget
-    -> LLM evidence-coverage judge
-         -> (insufficient) one targeted query extension, then retrieve again
-    -> LLM sourced synthesis [1]...[N]
-    -> syntactic citation-ID validation / abstention
-    -> trace + messages, feedback possible
+question + user_id + session_id
+    -> AGENT_ENABLED=false: existing single-query RAG
+    -> AGENT_ENABLED=true: LangGraph
+         route_and_plan (simple fast route or bounded JSON plan)
+         -> retrieve (existing BGE-M3 + BM25 + RRF + SQL visibility + optional rerank)
+         -> assess_evidence per aspect
+              -> (gap and budget available) targeted_retrieve -> assess_evidence
+              -> compose_answer
+         -> validate_answer (citations, unsupported-claim guards, bounded repair)
+         -> finish
+    -> PostgreSQL SearchTrace with node trajectory, decisions, queries, source IDs,
+       gaps, per-node latency, tokens and bounded call counters
 ```
 
 **Evidence is always SQL-filtered** even if stale derived search indexes return older records. Numeric citation ID maps to an immutable search child, whose parent text is displayed with its exact start/end offsets. The generator sees the parent context; the UI highlights the search child.
@@ -57,7 +56,17 @@ error falls back to the original RRF order and records the reason; it cannot rei
 a document removed by the visibility gate. Temporal evidence-gate and citation repair
 remain downstream and unchanged.
 
-Multi-document questions: planner decomposes into separate search forms. In a future iteration, store subquestion-to-document coverage and require one grounded source per subquestion. Current judge may be imperfect.
+Multi-document questions: planner decomposes into separate aspects and search forms while
+the original question remains first. Assessment records aspect-to-source coverage and gaps.
+Planner/assessor JSON errors use controlled fallback. The assessment is not an independent
+source of facts and remains imperfect; `AGENT_ENABLED=false` is the default after the
+CLIP-006 experiment.
+
+Agent limits are enforced before calls: at most three search calls, one retry and four
+LLM calls by default. The only graph loop is
+`assess_evidence -> targeted_retrieve -> assess_evidence`; retry/search budgets and
+LangGraph recursion limit make it finite. State is request-local and is not long-term or
+shared memory.
 
 ## Document temporality and contradiction
 

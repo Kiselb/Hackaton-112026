@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from .agent import run_agent
 from .answering import (
     build_answer_prompt,
     build_citation_repair_prompt,
@@ -184,6 +185,63 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
     )
     db.add(trace)
     db.commit()
+    agent_fallback_reason = None
+    if settings.agent_enabled:
+        try:
+            result = run_agent(
+                payload.question,
+                payload.user_id,
+                payload.session_id,
+                str(trace.id),
+            )
+        except Exception as exc:
+            agent_fallback_reason = str(exc)
+        else:
+            latency_ms = round((time.perf_counter() - started) * 1000)
+            sources = result["sources"]
+            usage = result["usage"]
+            retrieval_trace = result["retrieval"]
+            details = result["trace_details"]
+            validation = details.get("validation", {})
+            trace.answer = result["answer"]
+            trace.retrieved_count = result["retrieved_count"]
+            trace.selected_count = len(sources)
+            trace.prompt_tokens = usage.get("prompt_eval_count")
+            trace.completion_tokens = usage.get("eval_count")
+            trace.latency_ms = latency_ms
+            trace.status = "ok"
+            trace.details = details
+            db.commit()
+            return {
+                "answer": result["answer"],
+                "sources": sources,
+                "retrieval": retrieval_trace,
+                "trace_id": str(trace.id),
+                "metrics": {
+                    "latency_ms": latency_ms,
+                    "prompt_tokens": trace.prompt_tokens,
+                    "completion_tokens": trace.completion_tokens,
+                    "retrieved_count": result["retrieved_count"],
+                    "selected_count": len(sources),
+                    "done_reason": None,
+                    "citations_valid": validation.get("citations_valid", False),
+                    "empty_answer": not bool(result["answer"]),
+                    "citation_repair_attempted": validation.get(
+                        "citation_repair_attempted", False
+                    ),
+                    "temporal_guard_applied": (
+                        details.get("refusal_reason") == "temporal_evidence_gap"
+                    ),
+                    "rerank_status": retrieval_trace["status"],
+                    "rerank_latency_ms": retrieval_trace["latency_ms"],
+                    "rerank_fallback_reason": retrieval_trace["fallback_reason"],
+                    "agent_enabled": True,
+                    "agent_search_calls": details.get("search_calls", 0),
+                    "agent_llm_calls": details.get("llm_calls", 0),
+                    "agent_steps": details.get("step_count", 0),
+                    "agent_retries": details.get("retries", 0),
+                },
+            }
     citation_repair_attempted = False
     citation_repair_error = None
     temporal_guard_applied = False
@@ -226,6 +284,8 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                 trace.latency_ms = latency_ms
                 trace.status = "empty"
                 trace.details = {
+                    "mode": "baseline",
+                    "agent_fallback_reason": agent_fallback_reason,
                     "source_ids": [source["chunk_id"] for source in sources],
                     "done_reason": usage.get("done_reason"),
                     "ollama": ollama_metrics(usage),
@@ -287,6 +347,8 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
         trace.latency_ms = latency_ms
         trace.status = "ok"
         trace.details = {
+            "mode": "baseline",
+            "agent_fallback_reason": agent_fallback_reason,
             "source_ids": [source["chunk_id"] for source in sources],
             "done_reason": usage.get("done_reason"),
             "citations_valid": citations_valid if sources else False,
@@ -317,6 +379,8 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                 "rerank_status": retrieval_trace["status"],
                 "rerank_latency_ms": retrieval_trace["latency_ms"],
                 "rerank_fallback_reason": retrieval_trace["fallback_reason"],
+                "agent_enabled": False,
+                "agent_fallback_reason": agent_fallback_reason,
                 **ollama_metrics(usage),
             },
         }
@@ -325,7 +389,11 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
     except Exception as exc:
         trace.status = "failed"
         trace.latency_ms = round((time.perf_counter() - started) * 1000)
-        trace.details = {"error": str(exc)}
+        trace.details = {
+            "mode": "baseline",
+            "agent_fallback_reason": agent_fallback_reason,
+            "error": str(exc),
+        }
         db.commit()
         raise HTTPException(503, detail=f"Локальный RAG недоступен: {exc}") from exc
 
@@ -373,12 +441,15 @@ def traces(db: Session = Depends(get_db)) -> list[dict]:
         {
             "id": str(row.id),
             "question": row.question,
+            "user_id": row.user_id,
+            "session_id": row.session_id,
             "status": row.status,
             "latency_ms": row.latency_ms,
             "prompt_tokens": row.prompt_tokens,
             "completion_tokens": row.completion_tokens,
             "retrieved_count": row.retrieved_count,
             "selected_count": row.selected_count,
+            "details": row.details,
             "created_at": row.created_at.isoformat(),
         }
         for row in rows

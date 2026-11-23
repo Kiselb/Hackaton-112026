@@ -130,6 +130,37 @@ def git_sha() -> str:
     ).strip()
 
 
+def source_state() -> dict[str, Any]:
+    paths = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=ROOT,
+    ).split(b"\0")
+    source_hash = hashlib.sha256()
+    file_count = 0
+    for raw_path in sorted(path for path in paths if path):
+        relative = raw_path.decode("utf-8")
+        path = ROOT / relative
+        if not path.is_file():
+            continue
+        source_hash.update(relative.replace("\\", "/").encode("utf-8"))
+        source_hash.update(b"\0")
+        source_hash.update(path.read_bytes())
+        source_hash.update(b"\0")
+        file_count += 1
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+    )
+    return {
+        "sha256": source_hash.hexdigest(),
+        "file_count": file_count,
+        "dirty": bool(status.strip()),
+        "status_porcelain": status.splitlines(),
+    }
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -253,6 +284,8 @@ def report_markdown(run: dict[str, Any], results: list[dict[str, Any]]) -> str:
         f"# Evaluation report: {run['experiment_id']}", "",
         f"Dataset: `{run['dataset']['id']}` / `{run['dataset']['version']}`  ",
         f"Git SHA: `{run['git_commit_sha']}`  ",
+        f"Source tree SHA-256: `{run['source_state']['sha256']}`  ",
+        f"Dirty worktree: **{run['source_state']['dirty']}**  ",
         f"Corpus SHA-256: `{run['corpus']['hash']}`", "",
         "## Aggregate", "", "```json",
         json.dumps(run["summary"], ensure_ascii=False, indent=2), "```", "",
@@ -322,7 +355,11 @@ def evaluate(args: argparse.Namespace) -> int:
     settings = get_settings()
     started = datetime.now().astimezone()
     commit_sha = git_sha()
-    experiment_id = f"{dataset_path.stem}-{started:%Y%m%dT%H%M%S%z}-{commit_sha[:8]}"
+    actual_source = source_state()
+    experiment_id = (
+        f"{dataset_path.stem}-{started:%Y%m%dT%H%M%S%z}-"
+        f"{commit_sha[:8]}-{actual_source['sha256'][:8]}"
+    )
     output_dir = Path(args.output_dir).resolve() / experiment_id
     output_dir.mkdir(parents=True, exist_ok=False)
     results: list[dict[str, Any]] = []
@@ -357,11 +394,12 @@ def evaluate(args: argparse.Namespace) -> int:
     dataset_id = dataset_parts[0]
     dataset_version = dataset_parts[1] if len(dataset_parts) == 2 else "unversioned"
     run = {
-        "format_version": "clip-evaluation-run/v1",
+        "format_version": "clip-evaluation-run/v2",
         "experiment_id": experiment_id,
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
         "git_commit_sha": commit_sha,
+        "source_state": actual_source,
         "dataset": {
             "id": dataset_id,
             "version": dataset_version,
@@ -390,7 +428,9 @@ def evaluate(args: argparse.Namespace) -> int:
         },
         "retrieval": {
             "strategy": (
-                "dense_bge_m3_plus_bm25_rrf_cross_encoder"
+                "bounded_langgraph_dense_bm25_rrf"
+                if settings.agent_enabled
+                else "dense_bge_m3_plus_bm25_rrf_cross_encoder"
                 if settings.rerank_enabled
                 else "dense_bge_m3_plus_bm25_rrf"
             ),
@@ -401,6 +441,12 @@ def evaluate(args: argparse.Namespace) -> int:
             "selected_parents": settings.rerank_top_k,
             "qdrant_collection": settings.qdrant_collection,
             "opensearch_index": settings.opensearch_index,
+        },
+        "agent": {
+            "enabled": settings.agent_enabled,
+            "max_search_calls": settings.agent_max_search_calls,
+            "max_retries": settings.agent_max_retries,
+            "max_llm_calls": settings.agent_max_llm_calls,
         },
         "readiness": ready,
         "summary": aggregate_results(results),

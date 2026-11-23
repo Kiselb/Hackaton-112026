@@ -90,6 +90,10 @@ RERANK_MODEL_REVISION=
 RERANK_DEVICE=cpu
 RERANK_CANDIDATES=24
 RERANK_TOP_K=8
+AGENT_ENABLED=false
+AGENT_MAX_SEARCH_CALLS=3
+AGENT_MAX_RETRIES=1
+AGENT_MAX_LLM_CALLS=4
 ```
 
 `OLLAMA_THINK` передаётся верхнеуровневым полем `/api/chat`, а остальные два значения —
@@ -101,6 +105,10 @@ Reranker загружается лениво только при RERANK_ENABLED=
 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e; без явной revision Hugging Face может
 разрешить более новую версию модели. Reranker работает на CPU и не меняет размещение
 Ollama на GPU.
+
+Bounded LangGraph agent также выключен по умолчанию. Он использует тот же локальный
+Qwen и существующий hybrid retrieval; лимиты search/retry/LLM применяются при каждом
+исполнении. Отдельные внешние API и shared memory не используются.
 
 ### Диагностика TLS timeout
 

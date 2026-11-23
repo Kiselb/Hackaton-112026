@@ -15,16 +15,17 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - BM25 в OpenSearch и reciprocal-rank fusion;
 - финальная проверка `active=true` и `status=ready` по PostgreSQL;
 - опциональный локальный CrossEncoder reranking после проверки активности;
+- опциональный bounded LangGraph agent с evidence assessment и answer validation;
 - локальный ответ Ollama с numbered sources и проверкой номеров цитат;
 - traces, timings и token counts в PostgreSQL;
 - деактивация и восстановление документов;
 - React UI поиска, источников и административного реестра;
 - воспроизводимый smoke-test upload → ask → deactivate → ask → restore → ask.
 
-LangGraph, MultiQuery и LLM Judge пока не реализованы. CrossEncoder reranker
-реализован за флагом и оставлен выключенным по умолчанию: эксперимент CLIP-005
-улучшил ранжирование, но не итоговое качество ответов и добавил около 3,3 секунды
-CPU latency на запрос.
+Bounded LangGraph agent и CrossEncoder reranker реализованы за независимыми флагами
+и оставлены выключенными по умолчанию. CLIP-006 улучшил корректность отказов, но
+добавил около 3,5 секунды mean latency и показал небольшую регрессию автоматической
+required-facts метрики, поэтому baseline остаётся default.
 
 ## Изоляция данных
 
@@ -61,6 +62,11 @@ Set-Location ..
 Reranker настраивается через `RERANK_ENABLED`, `RERANK_MODEL`,
 `RERANK_MODEL_REVISION`, `RERANK_DEVICE`, `RERANK_CANDIDATES` и
 `RERANK_TOP_K`; без явного включения модель не загружается.
+
+Agent настраивается через `AGENT_ENABLED`, `AGENT_MAX_SEARCH_CALLS`,
+`AGENT_MAX_RETRIES` и `AGENT_MAX_LLM_CALLS`. Defaults: `false`, 3, 1 и 4.
+При исключении agent runtime запрос контролируемо выполняется существующим RAG,
+а причина fallback сохраняется в trace.
 
 Backend:
 
@@ -111,11 +117,17 @@ backend-процесса:
 $env:RERANK_ENABLED='true'
 $env:RERANK_MODEL_REVISION='953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e'
 .\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v2.jsonl
+
+$env:RERANK_ENABLED='false'
+$env:AGENT_ENABLED='true'
+.\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v2.jsonl
 ```
 
 Runner использует отдельные PostgreSQL schema, Qdrant collection, OpenSearch index и
 storage, проверяет SHA-256 корпуса и не меняет пользовательские индексы. Он сохраняет
 run.json, cases.jsonl и report.md в исключённом из Git каталоге eval/results/.
+Run v2 также сохраняет SHA-256 фактического source tree и dirty-status, поэтому
+незакоммиченный эксперимент нельзя спутать с чистым HEAD.
 Сравнение двух прогонов: scripts/evaluate.py --compare RUN_A RUN_B.
 
 Методика: [docs/EVALUATION_LAB.md](docs/EVALUATION_LAB.md). Протокол:
@@ -123,6 +135,8 @@ run.json, cases.jsonl и report.md в исключённом из Git катал
 [docs/reports/CLIP003_BASELINE.md](docs/reports/CLIP003_BASELINE.md).
 Эксперимент с reranking:
 [docs/reports/CLIP005_RERANKING.md](docs/reports/CLIP005_RERANKING.md).
+Эксперимент с bounded agent:
+[docs/reports/CLIP006_AGENT.md](docs/reports/CLIP006_AGENT.md).
 
 Smoke следует запускать на свежих проектных ресурсах: повторный запуск загружает новые
 документы. Он проверяет retrieval, LLM, citations, traces, деактивацию и восстановление,
@@ -159,7 +173,7 @@ registry. Для `/api/chat` приложение отправляет конф�
 - нет OCR, распознавания таблиц и сканов;
 - нет аутентификации, ACL и production security;
 - нет очереди ingestion и автоматической reconciliation между тремя хранилищами;
-- синтаксическая проверка номера цитаты не доказывает поддержку утверждения источником;
+- evidence assessment и проверка номера цитаты не заменяют экспертную entailment-проверку;
 - baseline измерен на синтетических документах и не является оценкой качества на
   производственном корпусе;
 - frontend доступен только как dev server или собранный `frontend/dist`; раздача
