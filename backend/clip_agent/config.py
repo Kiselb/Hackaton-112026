@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     opensearch_index: str = "clip_agent_sparse_v1"
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:9b"
+    ollama_think: bool = False
+    ollama_temperature: float = 0.0
+    ollama_num_predict: int = 512
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: str = "cpu"
     storage_root: Path = Path("storage")

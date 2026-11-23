@@ -21,8 +21,8 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - воспроизводимый smoke-test upload → ask → deactivate → ask → restore → ask.
 
 Архитектурные планы LangGraph, multi-query judge и reranker из
-[ARCHITECTURE.md](ARCHITECTURE.md) пока не реализованы; CLIP-001 ограничен устранением
-блокеров запуска и созданием проверяемого базового контура.
+[ARCHITECTURE.md](ARCHITECTURE.md) пока не реализованы: сначала зафиксирован
+воспроизводимый baseline существующего RAG-контура на целевой Qwen-модели.
 
 ## Изоляция данных
 
@@ -84,7 +84,7 @@ npm run build
 npm audit --omit=dev
 Set-Location ..
 
-.\.venv\Scripts\python.exe scripts\smoke_test.py --output smoke-results.json
+.\.venv\Scripts\python.exe scripts\smoke_test.py --model qwen3.5:9b --output smoke-results-qwen.json
 ```
 
 Smoke следует запускать на свежих проектных ресурсах: повторный запуск загружает новые
@@ -105,13 +105,14 @@ Smoke следует запускать на свежих проектных р�
 
 OpenAPI: `http://127.0.0.1:8000/docs`.
 
-## Текущее состояние CLIP-001
+## Текущее состояние CLIP-002
 
 На проверенной машине backend, frontend, отдельная БД/индексы, dense+sparse retrieval,
-document lifecycle и traces работают. Целевая модель `qwen3.5:9b` не скачалась из-за
-TLS timeout до `registry.ollama.ai:443`; поэтому Qwen baseline честно отмечен как
-`not measured`. Диагностический прогон с имевшейся TinyLlama подтвердил GPU inference
-и технический контур, но провалил проверку цитат.
+document lifecycle и traces работают. `qwen3.5:9b` установлена из официального Ollama
+registry. Для `/api/chat` приложение отправляет конфигурируемые `think: false`,
+`temperature: 0` и `num_predict: 512`; пустые ответы и причина завершения сохраняются
+в trace. Изолированный smoke-test подтвердил обе ставки пени, правильные источники,
+отсутствие выдуманного приоритета, деактивацию/восстановление и GPU inference.
 
 Фактические результаты и ограничения:
 [docs/BASELINE_RESULTS.md](docs/BASELINE_RESULTS.md).
@@ -122,7 +123,8 @@ TLS timeout до `registry.ollama.ai:443`; поэтому Qwen baseline чест
 - нет аутентификации, ACL и production security;
 - нет очереди ingestion и автоматической reconciliation между тремя хранилищами;
 - синтаксическая проверка номера цитаты не доказывает поддержку утверждения источником;
-- диагностический ответ TinyLlama не является baseline целевой Qwen-модели;
+- baseline измерен на синтетических документах и не является оценкой качества на
+  производственном корпусе;
 - frontend доступен только как dev server или собранный `frontend/dist`; раздача
   production bundle backend-ом не настроена.
 

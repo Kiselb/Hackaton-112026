@@ -77,16 +77,80 @@ ollama pull qwen3.5:9b
 ollama list
 ```
 
-Если `ollama pull` завершается `TLS handshake timeout`, проверить без изменения сети:
+Параметры Qwen по умолчанию уже находятся в `.env.example`:
+
+```dotenv
+OLLAMA_MODEL=qwen3.5:9b
+OLLAMA_THINK=false
+OLLAMA_TEMPERATURE=0
+OLLAMA_NUM_PREDICT=512
+```
+
+`OLLAMA_THINK` передаётся верхнеуровневым полем `/api/chat`, а остальные два значения —
+через `options`. Пустой ответ считается ошибкой, а `done_reason`, token counts и Ollama
+durations сохраняются в trace.
+
+### Диагностика TLS timeout
+
+Если `ollama pull` завершается `TLS handshake timeout`, сначала выполнить read-only
+проверки без изменения сети:
 
 ```powershell
 Resolve-DnsName registry.ollama.ai
 Test-NetConnection registry.ollama.ai -Port 443
 curl.exe -I --connect-timeout 15 https://registry.ollama.ai/v2/
+netsh winhttp show proxy
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' |
+  Select-Object ProxyEnable, ProxyServer
 ```
 
-Нужен исходящий HTTPS к `registry.ollama.ai:443`. После восстановления доступа повторить
-`ollama pull qwen3.5:9b`. Настройки proxy/firewall самостоятельно не менять.
+На проверенной машине прямой IPv4 HTTPS зависал, а локальный Windows proxy был настроен
+на `127.0.0.1:10808`. Гипотеза ML-KEM была проверена отдельным процессом Ollama:
+`GODEBUG=tlsmlkem=0` в одиночку не устранил timeout. Успешной оказалась передача уже
+существующего proxy только диагностическому процессу; глобальные переменные, firewall,
+Docker networking и проверка TLS-сертификатов не менялись.
+
+Подставить адрес из собственной настройки `ProxyServer`, затем запустить отдельный
+Ollama в терминале 1:
+
+```powershell
+$env:GODEBUG='tlsmlkem=0'
+$env:OLLAMA_HOST='127.0.0.1:11435'
+$env:HTTP_PROXY='http://127.0.0.1:10808'
+$env:HTTPS_PROXY='http://127.0.0.1:10808'
+$env:NO_PROXY='127.0.0.1,localhost'
+ollama serve
+```
+
+В терминале 2:
+
+```powershell
+$env:OLLAMA_HOST='http://127.0.0.1:11435'
+ollama pull qwen3.5:9b
+ollama show qwen3.5:9b
+```
+
+После загрузки остановить диагностический процесс. Обычный Ollama на `11434` увидит
+модель в общем локальном хранилище. `GODEBUG=tlsmlkem=0` здесь оставлен только для
+воспроизводимости проверки гипотезы и не считается исправлением.
+
+Если официальный registry недоступен даже через разрешённый proxy, допустим явный
+локальный GGUF-импорт. Скачать совместимый GGUF из доверенного источника, проверить
+checksum и создать модель под отличающимся именем:
+
+```text
+# Modelfile
+FROM C:\models\qwen3.5-9b-q4_k_m.gguf
+PARAMETER num_ctx 4096
+```
+
+```powershell
+ollama create qwen3.5:9b-local-gguf -f .\Modelfile
+```
+
+Затем явно указать `OLLAMA_MODEL=qwen3.5:9b-local-gguf` и отметить альтернативу в
+результатах. Нельзя молча выдавать импорт за официальный `qwen3.5:9b`; для vision также
+потребуются совместимые projector-файлы. Текущий baseline использует официальный registry.
 
 ## 4. Запуск
 
@@ -128,7 +192,7 @@ Set-Location ..
 На свежих ресурсах выполнить:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\smoke_test.py --output smoke-results.json
+.\.venv\Scripts\python.exe scripts\smoke_test.py --model qwen3.5:9b --output smoke-results-qwen.json
 ```
 
 Smoke загружает все `examples/*.txt`, задаёт вопрос о противоречащих ставках,

@@ -199,16 +199,45 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                 json={
                     "model": settings.ollama_model,
                     "stream": False,
+                    "think": settings.ollama_think,
                     "messages": [{"role": "user", "content": prompt}],
-                    "options": {"temperature": 0, "num_predict": 512},
+                    "options": {
+                        "temperature": settings.ollama_temperature,
+                        "num_predict": settings.ollama_num_predict,
+                    },
                 },
                 timeout=300,
             )
             response.raise_for_status()
             usage = response.json()
             answer = usage["message"]["content"].strip()
+            if not answer:
+                latency_ms = round((time.perf_counter() - started) * 1000)
+                trace.answer = ""
+                trace.retrieved_count = retrieved_count
+                trace.selected_count = len(sources)
+                trace.prompt_tokens = usage.get("prompt_eval_count")
+                trace.completion_tokens = usage.get("eval_count")
+                trace.latency_ms = latency_ms
+                trace.status = "empty"
+                trace.details = {
+                    "source_ids": [source["chunk_id"] for source in sources],
+                    "done_reason": usage.get("done_reason"),
+                    "ollama": ollama_metrics(usage),
+                }
+                db.commit()
+                raise HTTPException(
+                    503,
+                    detail={
+                        "message": "Ollama returned an empty answer",
+                        "done_reason": usage.get("done_reason"),
+                    },
+                )
             valid = {int(value) for value in re.findall(r"\[(\d+)\]", answer)}
-            if not valid or any(value < 1 or value > len(sources) for value in valid):
+            citations_valid = bool(valid) and not any(
+                value < 1 or value > len(sources) for value in valid
+            )
+            if not citations_valid:
                 answer += "\n\nПримечание: автоматическая проверка не подтвердила корректные номера цитат."
         latency_ms = round((time.perf_counter() - started) * 1000)
         trace.answer = answer
@@ -218,7 +247,13 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
         trace.completion_tokens = usage.get("eval_count")
         trace.latency_ms = latency_ms
         trace.status = "ok"
-        trace.details = {"source_ids": [source["chunk_id"] for source in sources]}
+        trace.details = {
+            "source_ids": [source["chunk_id"] for source in sources],
+            "done_reason": usage.get("done_reason"),
+            "citations_valid": citations_valid if sources else False,
+            "empty_answer": False,
+            "ollama": ollama_metrics(usage),
+        }
         db.commit()
         return {
             "answer": answer,
@@ -230,14 +265,33 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                 "completion_tokens": trace.completion_tokens,
                 "retrieved_count": retrieved_count,
                 "selected_count": len(sources),
+                "done_reason": usage.get("done_reason"),
+                "citations_valid": citations_valid if sources else False,
+                "empty_answer": False,
+                **ollama_metrics(usage),
             },
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         trace.status = "failed"
         trace.latency_ms = round((time.perf_counter() - started) * 1000)
         trace.details = {"error": str(exc)}
         db.commit()
         raise HTTPException(503, detail=f"Локальный RAG недоступен: {exc}") from exc
+
+
+def ollama_metrics(payload: dict) -> dict:
+    result = {}
+    for name in (
+        "total_duration",
+        "load_duration",
+        "prompt_eval_duration",
+        "eval_duration",
+    ):
+        value = payload.get(name)
+        result[f"{name}_ms"] = round(value / 1_000_000, 3) if value is not None else None
+    return result
 
 
 @app.get("/api/v1/admin/analytics")

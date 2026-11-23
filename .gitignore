@@ -9,4 +9,4 @@ __pycache__/
 node_modules/
 frontend/dist/
 storage/
-smoke-results.json
+smoke-results*.json
