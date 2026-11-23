@@ -1,0 +1,32 @@
+:root { font-family: Inter, "Segoe UI", sans-serif; color: #18231f; background: #eef3ef; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, textarea { font: inherit; }
+button { border: 0; border-radius: 8px; padding: .72rem 1rem; cursor: pointer; background: #155f45; color: white; }
+button:disabled { opacity: .6; }
+main { max-width: 1120px; margin: 0 auto; padding: 2rem; }
+header { display: flex; justify-content: space-between; align-items: end; margin-bottom: 2rem; border-bottom: 1px solid #cad8d0; padding-bottom: 1rem; }
+h1 { margin: .2rem 0 0; font-size: 2.2rem; }
+.eyebrow { color: #297a5e; text-transform: uppercase; letter-spacing: .14em; font-size: .72rem; font-weight: 700; }
+nav { display: flex; gap: .5rem; }
+nav button { color: #315348; background: transparent; }
+nav button.active { color: white; background: #155f45; }
+.ask, .answer, .sources article, .upload, .registry, .cards > div { background: white; padding: 1.25rem; border-radius: 12px; box-shadow: 0 5px 22px #1f493311; }
+.ask { display: grid; gap: .8rem; }
+.ask label { font-weight: 700; }
+textarea { min-height: 100px; resize: vertical; border: 1px solid #b9cbc1; border-radius: 8px; padding: .8rem; }
+.answer { margin-top: 1rem; white-space: pre-wrap; }
+.metrics { display: flex; flex-wrap: wrap; gap: .5rem; }
+.metrics span { background: #e9f4ed; padding: .35rem .6rem; border-radius: 99px; font-size: .8rem; }
+.sources { display: grid; gap: 1rem; margin-top: 1rem; }
+.sources h3 { margin: 0 0 .25rem; }
+small { color: #67776f; display: block; }
+mark { background: #e6d994; }
+.error { background: #ffe4e4; color: #7a1b1b; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; white-space: pre-wrap; }
+.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1rem; }
+.cards b { display: block; font-size: 1.8rem; }
+.cards span { color: #64736c; }
+.upload { display: flex; gap: .7rem; margin-bottom: 1rem; }
+.upload input { border: 1px solid #b9cbc1; border-radius: 8px; padding: .7rem; }
+.registry > div { display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-bottom: 1px solid #e2e9e5; }
+@media (max-width: 720px) { header { align-items: start; gap: 1rem; flex-direction: column; } .cards { grid-template-columns: 1fr 1fr; } .upload { flex-direction: column; } main { padding: 1rem; } }

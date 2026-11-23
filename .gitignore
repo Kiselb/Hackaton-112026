@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.tsbuildinfo
+.pytest_cache/
+.ruff_cache/
+node_modules/
+frontend/dist/
+storage/
+smoke-results.json
