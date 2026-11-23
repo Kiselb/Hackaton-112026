@@ -1,4 +1,3 @@
-import re
 import time
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -10,6 +9,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from .answering import (
+    build_answer_prompt,
+    build_citation_repair_prompt,
+    build_temporal_abstention,
+    citation_ids_admissible,
+    merge_ollama_usage,
+    requires_temporal_abstention,
+)
 from .chunking import chunk_text
 from .config import get_settings
 from .db import Chunk, Document, SearchTrace, SessionLocal, init_db
@@ -177,23 +184,21 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
     )
     db.add(trace)
     db.commit()
+    citation_repair_attempted = False
+    citation_repair_error = None
+    temporal_guard_applied = False
     try:
         sources, retrieved_count = retrieve(payload.question)
         if not sources:
             answer = "В активных документах не найдено достаточно данных для ответа."
             usage = {}
+        elif requires_temporal_abstention(payload.question, sources):
+            answer = build_temporal_abstention(sources)
+            usage = {}
+            citations_valid = citation_ids_admissible(answer, len(sources))
+            temporal_guard_applied = True
         else:
-            evidence = "\n\n".join(
-                f"[{number}] {source['title']} ({source['filename']}):\n{source['parent_text']}"
-                for number, source in enumerate(sources, start=1)
-            )
-            prompt = (
-                "Ты корпоративный поисковый ассистент. Отвечай только по источникам ниже. "
-                "Каждое существенное утверждение сопровождай ссылкой [N]. Если источники "
-                "противоречат друг другу, явно назови обе позиции и не выдумывай приоритет. "
-                "Если данных недостаточно, скажи об этом. Ответ на русском языке.\n\n"
-                f"Вопрос: {payload.question}\n\nИсточники:\n{evidence}"
-            )
+            prompt = build_answer_prompt(payload.question, sources)
             response = httpx.post(
                 f"{settings.ollama_url}/api/chat",
                 json={
@@ -233,12 +238,45 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                         "done_reason": usage.get("done_reason"),
                     },
                 )
-            valid = {int(value) for value in re.findall(r"\[(\d+)\]", answer)}
-            citations_valid = bool(valid) and not any(
-                value < 1 or value > len(sources) for value in valid
-            )
+            citations_valid = citation_ids_admissible(answer, len(sources))
             if not citations_valid:
-                answer += "\n\nПримечание: автоматическая проверка не подтвердила корректные номера цитат."
+                citation_repair_attempted = True
+                try:
+                    repair_response = httpx.post(
+                        f"{settings.ollama_url}/api/chat",
+                        json={
+                            "model": settings.ollama_model,
+                            "stream": False,
+                            "think": settings.ollama_think,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": build_citation_repair_prompt(
+                                        prompt, answer, len(sources)
+                                    ),
+                                }
+                            ],
+                            "options": {
+                                "temperature": settings.ollama_temperature,
+                                "num_predict": settings.ollama_num_predict,
+                            },
+                        },
+                        timeout=300,
+                    )
+                    repair_response.raise_for_status()
+                    repair_usage = repair_response.json()
+                    usage = merge_ollama_usage(usage, repair_usage)
+                    repaired_answer = repair_usage["message"]["content"].strip()
+                    if repaired_answer:
+                        answer = repaired_answer
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                    citation_repair_error = str(exc)
+                citations_valid = citation_ids_admissible(answer, len(sources))
+            if not citations_valid:
+                answer += (
+                    "\n\nПримечание: автоматическая проверка не подтвердила "
+                    "корректные номера цитат."
+                )
         latency_ms = round((time.perf_counter() - started) * 1000)
         trace.answer = answer
         trace.retrieved_count = retrieved_count
@@ -252,6 +290,9 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
             "done_reason": usage.get("done_reason"),
             "citations_valid": citations_valid if sources else False,
             "empty_answer": False,
+            "citation_repair_attempted": citation_repair_attempted,
+            "temporal_guard_applied": temporal_guard_applied,
+            "citation_repair_error": citation_repair_error,
             "ollama": ollama_metrics(usage),
         }
         db.commit()
@@ -268,6 +309,8 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                 "done_reason": usage.get("done_reason"),
                 "citations_valid": citations_valid if sources else False,
                 "empty_answer": False,
+                "citation_repair_attempted": citation_repair_attempted,
+                "temporal_guard_applied": temporal_guard_applied,
                 **ollama_metrics(usage),
             },
         }
@@ -297,13 +340,16 @@ def ollama_metrics(payload: dict) -> dict:
 @app.get("/api/v1/admin/analytics")
 def analytics(db: Session = Depends(get_db)) -> dict:
     total_documents = db.scalar(select(func.count()).select_from(Document)) or 0
-    active_documents = db.scalar(
-        select(func.count()).select_from(Document).where(Document.active.is_(True))
-    ) or 0
+    active_documents = (
+        db.scalar(select(func.count()).select_from(Document).where(Document.active.is_(True))) or 0
+    )
     total_queries = db.scalar(select(func.count()).select_from(SearchTrace)) or 0
-    failed_queries = db.scalar(
-        select(func.count()).select_from(SearchTrace).where(SearchTrace.status == "failed")
-    ) or 0
+    failed_queries = (
+        db.scalar(
+            select(func.count()).select_from(SearchTrace).where(SearchTrace.status == "failed")
+        )
+        or 0
+    )
     average_latency_ms = db.scalar(select(func.avg(SearchTrace.latency_ms)))
     return {
         "total_documents": total_documents,
