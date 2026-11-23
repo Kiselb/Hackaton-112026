@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from .config import get_settings
 from .db import Chunk, Document, SessionLocal
+from .reranking import rerank_candidates
 
 
 def reciprocal_rank_fusion(rankings: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
@@ -102,8 +103,42 @@ def index_chunks(chunks: list[Chunk]) -> None:
     oc.indices.refresh(settings.opensearch_index)
 
 
-def retrieve(question: str, limit: int = 8) -> tuple[list[dict], int]:
+def build_active_candidates(
+    fused: list[tuple[str, float]],
+    rows: list[tuple[Chunk, Document]],
+    candidate_cap: int,
+) -> tuple[list[dict], dict[str, tuple[Chunk, Document]]]:
+    by_id = {
+        str(chunk.id): (chunk, document)
+        for chunk, document in rows
+        if document.active and document.status == "ready"
+    }
+    candidates: list[dict] = []
+    for rank, (item_id, score) in enumerate(fused[:candidate_cap], start=1):
+        if item_id not in by_id:
+            continue
+        chunk, document = by_id[item_id]
+        candidates.append(
+            {
+                "chunk_id": str(chunk.id),
+                "document_id": str(document.id),
+                "title": document.title,
+                "filename": document.filename,
+                "page": chunk.page,
+                "parent_text": chunk.parent_text,
+                "child_text": chunk.child_text,
+                "child_start": chunk.child_start,
+                "child_end": chunk.child_end,
+                "rrf_score": score,
+                "rank_before_rerank": rank,
+            }
+        )
+    return candidates, by_id
+
+
+def retrieve(question: str, limit: int | None = None) -> tuple[list[dict], int, dict]:
     settings = get_settings()
+    selected_limit = limit or settings.rerank_top_k
     vector = embed([question])[0]
     dense = qdrant().query_points(
         collection_name=settings.qdrant_collection, query=vector, limit=50
@@ -115,40 +150,42 @@ def retrieve(question: str, limit: int = 8) -> tuple[list[dict], int]:
     )
     sparse_ids = [hit["_id"] for hit in sparse_result["hits"]["hits"]]
     fused = reciprocal_rank_fusion([dense_ids, sparse_ids])
-    candidate_ids = [UUID(item_id) for item_id, _ in fused[:24]]
+    candidate_ids = [
+        UUID(item_id) for item_id, _ in fused[: settings.rerank_candidates]
+    ]
     if not candidate_ids:
-        return [], 0
+        ranked, rerank_trace = rerank_candidates(question, [])
+        return [], 0, {**rerank_trace, "candidates": []}
     with SessionLocal() as session:
         rows = session.execute(
             select(Chunk, Document)
             .join(Document, Chunk.document_id == Document.id)
             .where(Chunk.id.in_(candidate_ids), Document.active.is_(True), Document.status == "ready")
         ).all()
-    by_id = {str(chunk.id): (chunk, document) for chunk, document in rows}
+    active_candidates, by_id = build_active_candidates(
+        fused, rows, settings.rerank_candidates
+    )
+    ranked_candidates, rerank_trace = rerank_candidates(question, active_candidates)
     selected: list[dict] = []
     seen_parents: set[tuple[str, int]] = set()
-    for item_id, score in fused:
-        if item_id not in by_id:
-            continue
-        chunk, document = by_id[item_id]
-        parent_key = (str(document.id), chunk.ordinal)
+    for candidate in ranked_candidates:
+        chunk, document = by_id[candidate["chunk_id"]]
+        parent_key = (candidate["document_id"], chunk.ordinal)
         if parent_key in seen_parents:
             continue
         seen_parents.add(parent_key)
-        selected.append(
-            {
-                "chunk_id": str(chunk.id),
-                "document_id": str(document.id),
-                "title": document.title,
-                "filename": document.filename,
-                "page": chunk.page,
-                "parent_text": chunk.parent_text,
-                "child_text": chunk.child_text,
-                "child_start": chunk.child_start,
-                "child_end": chunk.child_end,
-                "score": score,
-            }
-        )
-        if len(selected) >= limit:
+        selected.append(candidate)
+        if len(selected) >= selected_limit:
             break
-    return selected, len(fused)
+    rerank_trace["candidates"] = [
+        {
+            "chunk_id": candidate["chunk_id"],
+            "document_id": candidate["document_id"],
+            "rrf_score": candidate["rrf_score"],
+            "reranker_score": candidate["reranker_score"],
+            "rank_before_rerank": candidate["rank_before_rerank"],
+            "rank_after_rerank": candidate["rank_after_rerank"],
+        }
+        for candidate in ranked_candidates
+    ]
+    return selected, len(fused), rerank_trace

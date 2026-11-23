@@ -24,8 +24,8 @@
 retrieval/latency/token deltas, число ошибок, ручная проверка и вывод. Улучшение одной
 средней метрики без анализа регрессий по сценариям не доказывает улучшение.
 
-## Будущие стратегии
+## Стратегии
 
-MultiQuery и reranking должны сохранять format_version=clip-evaluation-run/v1, тот же
-блок dataset, corpus hash, ранжированные retrieved_documents и полный блок retrieval
-с новым strategy. Тогда они сравниваются тем же CLI без миграции baseline.
+Reranking в CLIP-005 сохраняет format_version=clip-evaluation-run/v1, тот же блок
+dataset, corpus hash, retrieved_documents и полный retrieval trace. MultiQuery, если
+будет реализован отдельно, должен соблюдать тот же контракт и сравниваться тем же CLI.

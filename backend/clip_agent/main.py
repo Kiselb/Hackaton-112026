@@ -188,7 +188,7 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
     citation_repair_error = None
     temporal_guard_applied = False
     try:
-        sources, retrieved_count = retrieve(payload.question)
+        sources, retrieved_count, retrieval_trace = retrieve(payload.question)
         if not sources:
             answer = "В активных документах не найдено достаточно данных для ответа."
             usage = {}
@@ -229,6 +229,7 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                     "source_ids": [source["chunk_id"] for source in sources],
                     "done_reason": usage.get("done_reason"),
                     "ollama": ollama_metrics(usage),
+                    "reranking": retrieval_trace,
                 }
                 db.commit()
                 raise HTTPException(
@@ -293,12 +294,14 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
             "citation_repair_attempted": citation_repair_attempted,
             "temporal_guard_applied": temporal_guard_applied,
             "citation_repair_error": citation_repair_error,
+            "reranking": retrieval_trace,
             "ollama": ollama_metrics(usage),
         }
         db.commit()
         return {
             "answer": answer,
             "sources": sources,
+            "retrieval": retrieval_trace,
             "trace_id": str(trace.id),
             "metrics": {
                 "latency_ms": latency_ms,
@@ -311,6 +314,9 @@ def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
                 "empty_answer": False,
                 "citation_repair_attempted": citation_repair_attempted,
                 "temporal_guard_applied": temporal_guard_applied,
+                "rerank_status": retrieval_trace["status"],
+                "rerank_latency_ms": retrieval_trace["latency_ms"],
+                "rerank_fallback_reason": retrieval_trace["fallback_reason"],
                 **ollama_metrics(usage),
             },
         }

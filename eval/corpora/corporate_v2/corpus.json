@@ -1,0 +1,189 @@
+{
+  "corpus_id": "corporate_v2",
+  "version": "v2",
+  "description": "Synthetic hard-negative corpus for CLIP-005; gold fragments manually verified.",
+  "documents": [
+    {
+      "source_id": "corp-v2:order-201-alpha-retail",
+      "filename": "order_201_alpha_retail.txt",
+      "title": "Приказ № 201 «Пени по договорам Альфа — розничный канал»",
+      "path": "documents/order_201_alpha_retail.txt",
+      "fragments": [{"fragment_id": "cv2f:order-201-rate-scope", "quote": "по розничным договорам направления Альфа начисляется пеня 0,08 процента"}]
+    },
+    {
+      "source_id": "corp-v2:order-202-alpha-enterprise",
+      "filename": "order_202_alpha_enterprise.txt",
+      "title": "Приказ № 202 «Пени по договорам Альфа — корпоративный канал»",
+      "path": "documents/order_202_alpha_enterprise.txt",
+      "fragments": [{"fragment_id": "cv2f:order-202-rate-scope", "quote": "по корпоративным договорам направления Альфа начисляется пеня 0,04 процента"}]
+    },
+    {
+      "source_id": "corp-v2:order-203-beta",
+      "filename": "order_203_beta.txt",
+      "title": "Приказ № 203 «Пени по договорам Бета»",
+      "path": "documents/order_203_beta.txt",
+      "fragments": [{"fragment_id": "cv2f:order-203-rate-scope", "quote": "Для всех договоров продукта Бета пеня составляет 0,06 процента"}]
+    },
+    {
+      "source_id": "corp-v2:order-204-alpha-marketing",
+      "filename": "order_204_alpha_marketing.txt",
+      "title": "Приказ № 204 «Скидки направления Альфа»",
+      "path": "documents/order_204_alpha_marketing.txt",
+      "fragments": [{"fragment_id": "cv2f:order-204-discount", "quote": "допускается скидка до 8 процентов"}]
+    },
+    {
+      "source_id": "corp-v2:penalty-methodology",
+      "filename": "penalty_methodology_note.txt",
+      "title": "Методическая памятка о расчёте пени",
+      "path": "documents/penalty_methodology_note.txt",
+      "fragments": [{"fragment_id": "cv2f:penalty-day-method", "quote": "календарный день и рабочий день нельзя смешивать"}]
+    },
+    {
+      "source_id": "corp-v2:travel-moscow",
+      "filename": "travel_moscow.txt",
+      "title": "Положение о командировочных расходах — Москва",
+      "path": "documents/travel_moscow.txt",
+      "fragments": [{"fragment_id": "cv2f:travel-moscow-limits", "quote": "суточные для командировок в Москву составляют 1 200 рублей"}]
+    },
+    {
+      "source_id": "corp-v2:travel-regions",
+      "filename": "travel_regions.txt",
+      "title": "Положение о командировочных расходах — регионы России",
+      "path": "documents/travel_regions.txt",
+      "fragments": [{"fragment_id": "cv2f:travel-regions-limits", "quote": "по России вне Москвы составляют 900 рублей"}]
+    },
+    {
+      "source_id": "corp-v2:travel-abroad",
+      "filename": "travel_abroad.txt",
+      "title": "Положение о командировочных расходах — зарубежные поездки",
+      "path": "documents/travel_abroad.txt",
+      "fragments": [{"fragment_id": "cv2f:travel-abroad-limits", "quote": "зарубежных командировок составляют 45 евро"}]
+    },
+    {
+      "source_id": "corp-v2:travel-faq",
+      "filename": "travel_faq.txt",
+      "title": "Памятка путешественника: отчёт о командировке",
+      "path": "documents/travel_faq.txt",
+      "fragments": [{"fragment_id": "cv2f:travel-report", "quote": "Авансовый отчёт и подтверждающие документы передаются в бухгалтерию"}]
+    },
+    {
+      "source_id": "corp-v2:remote-it",
+      "filename": "remote_it.txt",
+      "title": "Регламент удалённой работы — ИТ-подразделение",
+      "path": "documents/remote_it.txt",
+      "fragments": [{"fragment_id": "cv2f:remote-it-days", "quote": "удалённо не более трёх дней в неделю"}]
+    },
+    {
+      "source_id": "corp-v2:remote-sales",
+      "filename": "remote_sales.txt",
+      "title": "Регламент удалённой работы — отдел продаж",
+      "path": "documents/remote_sales.txt",
+      "fragments": [{"fragment_id": "cv2f:remote-sales-days", "quote": "удалённо не более одного дня в неделю"}]
+    },
+    {
+      "source_id": "corp-v2:remote-security",
+      "filename": "remote_security_memo.txt",
+      "title": "Памятка по безопасности удалённой работы",
+      "path": "documents/remote_security_memo.txt",
+      "fragments": [{"fragment_id": "cv2f:remote-security-device", "quote": "запрещено сохранять корпоративные документы на личные устройства"}]
+    },
+    {
+      "source_id": "corp-v2:license-alpha-base",
+      "filename": "license_alpha_base.txt",
+      "title": "Правила лицензирования продукта Альфа — базовая редакция",
+      "path": "documents/license_alpha_base.txt",
+      "fragments": [{"fragment_id": "cv2f:license-alpha-base-term", "quote": "предоставляется на 12 месяцев и включает до 50 пользователей"}]
+    },
+    {
+      "source_id": "corp-v2:license-alpha-enterprise",
+      "filename": "license_alpha_enterprise.txt",
+      "title": "Правила лицензирования продукта Альфа — корпоративная редакция",
+      "path": "documents/license_alpha_enterprise.txt",
+      "fragments": [{"fragment_id": "cv2f:license-alpha-enterprise-term", "quote": "предоставляется на 24 месяца и включает до 500 пользователей"}]
+    },
+    {
+      "source_id": "corp-v2:license-beta",
+      "filename": "license_beta.txt",
+      "title": "Правила лицензирования продукта Бета",
+      "path": "documents/license_beta.txt",
+      "fragments": [{"fragment_id": "cv2f:license-beta-term", "quote": "действует шесть месяцев и включает 30 пользователей"}]
+    },
+    {
+      "source_id": "corp-v2:alpha-brochure",
+      "filename": "alpha_brochure.txt",
+      "title": "Продукт Альфа: информационная брошюра",
+      "path": "documents/alpha_brochure.txt",
+      "fragments": [{"fragment_id": "cv2f:alpha-brochure-disclaimer", "quote": "Юридический срок и лимит пользователей брошюра не устанавливает"}]
+    },
+    {
+      "source_id": "corp-v2:agency-approval",
+      "filename": "agency_approval.txt",
+      "title": "Регламент согласования агентских договоров",
+      "path": "documents/agency_approval.txt",
+      "fragments": [{"fragment_id": "cv2f:agency-approval-sequence", "quote": "руководитель подразделения, юридический отдел и финансовая служба"}]
+    },
+    {
+      "source_id": "corp-v2:partner-approval",
+      "filename": "partner_approval.txt",
+      "title": "Регламент согласования партнёрских договоров",
+      "path": "documents/partner_approval.txt",
+      "fragments": [{"fragment_id": "cv2f:partner-approval-sequence", "quote": "Партнёрский договор согласуют владелец продукта и юридический отдел"}]
+    },
+    {
+      "source_id": "corp-v2:invoice-terms",
+      "filename": "invoice_terms.txt",
+      "title": "Стандарт выставления счетов",
+      "path": "documents/invoice_terms.txt",
+      "fragments": [{"fragment_id": "cv2f:invoice-payment-term", "quote": "Оплата производится в течение десяти календарных дней"}]
+    },
+    {
+      "source_id": "corp-v2:procurement-current",
+      "filename": "procurement_current.txt",
+      "title": "Положение о закупках — редакция 2026 года",
+      "path": "documents/procurement_current.txt",
+      "fragments": [{"fragment_id": "cv2f:procurement-current-threshold", "quote": "Закупку до 300 000 рублей согласует руководитель подразделения"}]
+    },
+    {
+      "source_id": "corp-v2:procurement-archive",
+      "filename": "procurement_archive.txt",
+      "title": "Положение о закупках — архивная редакция 2024 года",
+      "path": "documents/procurement_archive.txt",
+      "fragments": [{"fragment_id": "cv2f:procurement-archive-threshold", "quote": "В архивной редакции указан порог 100 000 рублей"}]
+    },
+    {
+      "source_id": "corp-v2:bonus-sales",
+      "filename": "bonus_sales.txt",
+      "title": "Приказ о квартальной премии — отдел продаж",
+      "path": "documents/bonus_sales.txt",
+      "fragments": [{"fragment_id": "cv2f:bonus-sales-rule", "quote": "Премия отдела продаж составляет 20 процентов оклада"}]
+    },
+    {
+      "source_id": "corp-v2:bonus-support",
+      "filename": "bonus_support.txt",
+      "title": "Приказ о квартальной премии — служба поддержки",
+      "path": "documents/bonus_support.txt",
+      "fragments": [{"fragment_id": "cv2f:bonus-support-rule", "quote": "Премия службы поддержки составляет 15 процентов оклада"}]
+    },
+    {
+      "source_id": "corp-v2:vacation-policy",
+      "filename": "vacation_policy.txt",
+      "title": "Положение об отпусках",
+      "path": "documents/vacation_policy.txt",
+      "fragments": [{"fragment_id": "cv2f:vacation-days", "quote": "отпуск составляет 28 календарных дней"}]
+    },
+    {
+      "source_id": "corp-v2:retention-hr",
+      "filename": "retention_hr.txt",
+      "title": "Сроки хранения данных — кадровые документы",
+      "path": "documents/retention_hr.txt",
+      "fragments": [{"fragment_id": "cv2f:retention-candidate", "quote": "Резюме отклонённых кандидатов хранится шесть месяцев"}]
+    },
+    {
+      "source_id": "corp-v2:retention-support",
+      "filename": "retention_support.txt",
+      "title": "Сроки хранения данных — обращения поддержки",
+      "path": "documents/retention_support.txt",
+      "fragments": [{"fragment_id": "cv2f:retention-support-text", "quote": "Текст обращения клиента и вложения хранятся 18 месяцев"}]
+    }
+  ]
+}

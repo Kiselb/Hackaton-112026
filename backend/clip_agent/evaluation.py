@@ -89,6 +89,12 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
     retrieved = [item["source_id"] for item in sources]
     expected = list(case["expected_sources"])
     expected_set = set(expected)
+    expected_fragments = set(case.get("expected_fragments", []))
+    retrieved_fragments = [
+        fragment_id
+        for item in sources
+        for fragment_id in item.get("fragment_ids", [])
+    ]
 
     def recall_at(k: int) -> float | None:
         if not expected_set:
@@ -98,6 +104,22 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
     first_rank = next(
         (rank for rank, item in enumerate(retrieved, start=1) if item in expected_set), None
     )
+    relevance_grades = case.get("relevance_grades", {})
+
+    def ndcg_at(k: int) -> float | None:
+        if not relevance_grades:
+            return None
+        gains = [relevance_grades.get(item, 0) for item in retrieved[:k]]
+        ideal = sorted(relevance_grades.values(), reverse=True)[:k]
+
+        def dcg(values: list[int | float]) -> float:
+            return sum(
+                (2**grade - 1) / math.log2(rank + 1)
+                for rank, grade in enumerate(values, start=1)
+            )
+
+        ideal_score = dcg(ideal)
+        return dcg(gains) / ideal_score if ideal_score else None
     citation_numbers = _citation_numbers(answer)
     citations_present = bool(citation_numbers)
     citation_ids_admissible = all(
@@ -142,14 +164,31 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
                 "chunk_id": item.get("chunk_id"),
                 "filename": item.get("filename"),
                 "score": item.get("score"),
+                "rrf_score": item.get("rrf_score"),
+                "reranker_score": item.get("reranker_score"),
+                "rank_before_rerank": item.get("rank_before_rerank"),
+                "rank_after_rerank": item.get("rank_after_rerank"),
+                "fragment_ids": item.get("fragment_ids", []),
             }
             for rank, item in enumerate(sources, start=1)
         ],
+        "retrieval_trace": response.get("retrieval"),
         "metrics": {
+            "document_recall_at_1": recall_at(1),
+            "document_recall_at_3": recall_at(3),
             "document_recall_at_5": recall_at(5),
             "document_recall_at_8": recall_at(8),
             "mrr": 1 / first_rank if first_rank else (0.0 if expected_set else None),
+            "ndcg_at_5": ndcg_at(5),
             "expected_document_coverage": recall_at(len(retrieved)),
+            "all_required_sources_at_8": (
+                expected_set.issubset(set(retrieved[:8])) if expected_set else None
+            ),
+            "expected_fragment_coverage": (
+                len(expected_fragments.intersection(retrieved_fragments)) / len(expected_fragments)
+                if expected_fragments
+                else None
+            ),
             "citation_numbers": citation_numbers,
             "citations_present": citations_present,
             "citation_ids_admissible": citation_ids_admissible,
@@ -166,6 +205,7 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "latency_ms": metrics.get("latency_ms"),
             "input_tokens": metrics.get("prompt_tokens"),
             "output_tokens": metrics.get("completion_tokens"),
+            "rerank_latency_ms": metrics.get("rerank_latency_ms"),
         },
         "manual_review_required": manual_review_required,
         "manual_review_reason": (
@@ -203,10 +243,17 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "case_count": len(results),
         "completed_count": sum(item.get("error") is None for item in results),
         "error_count": sum(item.get("error") is not None for item in results),
+        "document_recall_at_1": _mean(values("document_recall_at_1")),
+        "document_recall_at_3": _mean(values("document_recall_at_3")),
         "document_recall_at_5": _mean(values("document_recall_at_5")),
         "document_recall_at_8": _mean(values("document_recall_at_8")),
         "mrr": _mean(values("mrr")),
+        "ndcg_at_5": _mean(values("ndcg_at_5")),
         "expected_document_coverage": _mean(values("expected_document_coverage")),
+        "all_required_sources_at_8_rate": _mean(
+            [float(v) for v in values("all_required_sources_at_8")]
+        ),
+        "expected_fragment_coverage": _mean(values("expected_fragment_coverage")),
         "citation_ids_valid_rate": _mean([float(v) for v in values("citation_ids_valid")]),
         "citations_present_rate": _mean([float(v) for v in values("citations_present")]),
         "citation_ids_admissible_rate": _mean(
@@ -231,6 +278,10 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             "median": round(statistics.median(latencies), 4) if latencies else None,
             "p95": _p95(latencies),
         },
+        "rerank_latency_ms": {
+            "mean": _mean(values("rerank_latency_ms")),
+            "total": round(sum(values("rerank_latency_ms")), 4),
+        },
         "tokens": {
             "input_total": sum(values("input_tokens")),
             "output_total": sum(values("output_tokens")),
@@ -242,8 +293,10 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def compare_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     keys = (
-        "document_recall_at_5", "document_recall_at_8", "mrr",
-        "expected_document_coverage", "citations_present_rate",
+        "document_recall_at_1", "document_recall_at_3", "document_recall_at_5",
+        "document_recall_at_8", "mrr", "ndcg_at_5", "expected_document_coverage",
+        "all_required_sources_at_8_rate", "expected_fragment_coverage",
+        "citations_present_rate",
         "citation_ids_admissible_rate", "citation_ids_valid_rate",
         "required_facts_pass_rate", "forbidden_claims_clear_rate",
         "abstention_accuracy",
@@ -265,6 +318,13 @@ def compare_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
             "right": after,
             "delta": round(after - before, 4) if before is not None and after is not None else None,
         }
+    before = left_summary.get("rerank_latency_ms", {}).get("mean")
+    after = right_summary.get("rerank_latency_ms", {}).get("mean")
+    metrics["rerank_latency_ms_mean"] = {
+        "left": before,
+        "right": after,
+        "delta": round(after - before, 4) if before is not None and after is not None else None,
+    }
     return {
         "left_experiment_id": left["experiment_id"],
         "right_experiment_id": right["experiment_id"],

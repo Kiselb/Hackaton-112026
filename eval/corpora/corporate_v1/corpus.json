@@ -1,0 +1,54 @@
+{
+  "corpus_id": "corporate_v1",
+  "version": "v1",
+  "documents": [
+    {
+      "source_id": "example:agency_contract",
+      "filename": "agency_contract.txt",
+      "title": "Регламент согласования агентских договоров",
+      "path": "../../../examples/agency_contract.txt",
+      "fragments": [
+        {
+          "fragment_id": "cv1f:agency-approval",
+          "quote": "Подписание допускается только после всех трёх согласований."
+        }
+      ]
+    },
+    {
+      "source_id": "example:order_101",
+      "filename": "order_101.txt",
+      "title": "Приказ № 101 от 10 января 2026 года",
+      "path": "../../../examples/order_101.txt",
+      "fragments": [
+        {
+          "fragment_id": "cv1f:order-101-penalty",
+          "quote": "пени в размере 0,10 процента"
+        }
+      ]
+    },
+    {
+      "source_id": "example:order_102",
+      "filename": "order_102.txt",
+      "title": "Приказ № 102 от 15 февраля 2026 года",
+      "path": "../../../examples/order_102.txt",
+      "fragments": [
+        {
+          "fragment_id": "cv1f:order-102-penalty",
+          "quote": "пени в размере 0,05 процента"
+        }
+      ]
+    },
+    {
+      "source_id": "example:product_alpha",
+      "filename": "product_alpha.txt",
+      "title": "Правила лицензирования продукта Альфа",
+      "path": "../../../examples/product_alpha.txt",
+      "fragments": [
+        {
+          "fragment_id": "cv1f:alpha-license-term",
+          "quote": "Лицензия предоставляется на один год"
+        }
+      ]
+    }
+  ]
+}

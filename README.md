@@ -14,15 +14,17 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - BGE-M3 embeddings на CPU и dense search в Qdrant;
 - BM25 в OpenSearch и reciprocal-rank fusion;
 - финальная проверка `active=true` и `status=ready` по PostgreSQL;
+- опциональный локальный CrossEncoder reranking после проверки активности;
 - локальный ответ Ollama с numbered sources и проверкой номеров цитат;
 - traces, timings и token counts в PostgreSQL;
 - деактивация и восстановление документов;
 - React UI поиска, источников и административного реестра;
 - воспроизводимый smoke-test upload → ask → deactivate → ask → restore → ask.
 
-Архитектурные планы LangGraph, multi-query judge и reranker из
-[ARCHITECTURE.md](ARCHITECTURE.md) пока не реализованы: сначала зафиксирован
-воспроизводимый baseline существующего RAG-контура на целевой Qwen-модели.
+LangGraph, MultiQuery и LLM Judge пока не реализованы. CrossEncoder reranker
+реализован за флагом и оставлен выключенным по умолчанию: эксперимент CLIP-005
+улучшил ранжирование, но не итоговое качество ответов и добавил около 3,3 секунды
+CPU latency на запрос.
 
 ## Изоляция данных
 
@@ -56,6 +58,10 @@ npm install
 Set-Location ..
 ```
 
+Reranker настраивается через `RERANK_ENABLED`, `RERANK_MODEL`,
+`RERANK_MODEL_REVISION`, `RERANK_DEVICE`, `RERANK_CANDIDATES` и
+`RERANK_TOP_K`; без явного включения модель не загружается.
+
 Backend:
 
 ```powershell
@@ -87,13 +93,24 @@ Set-Location ..
 .\.venv\Scripts\python.exe scripts\smoke_test.py --model qwen3.5:9b --output smoke-results-qwen.json
 ```
 
-## Evaluation Lab (CLIP-003)
+## Evaluation Lab (CLIP-003—005)
 
 Воспроизводимый baseline на 18 вручную сверенных сценариях запускается без отдельного
 backend-процесса:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v1.jsonl
+```
+
+Усложнённый `corporate_v2` хранится отдельно от `examples/`: 26 синтетических
+документов, 36 вопросов, устойчивые document/fragment ID и graded relevance.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v2.jsonl
+
+$env:RERANK_ENABLED='true'
+$env:RERANK_MODEL_REVISION='953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e'
+.\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v2.jsonl
 ```
 
 Runner использует отдельные PostgreSQL schema, Qdrant collection, OpenSearch index и
@@ -104,6 +121,8 @@ run.json, cases.jsonl и report.md в исключённом из Git катал
 Методика: [docs/EVALUATION_LAB.md](docs/EVALUATION_LAB.md). Протокол:
 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md). Фактический baseline:
 [docs/reports/CLIP003_BASELINE.md](docs/reports/CLIP003_BASELINE.md).
+Эксперимент с reranking:
+[docs/reports/CLIP005_RERANKING.md](docs/reports/CLIP005_RERANKING.md).
 
 Smoke следует запускать на свежих проектных ресурсах: повторный запуск загружает новые
 документы. Он проверяет retrieval, LLM, citations, traces, деактивацию и восстановление,

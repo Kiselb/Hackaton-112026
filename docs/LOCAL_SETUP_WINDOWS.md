@@ -84,11 +84,23 @@ OLLAMA_MODEL=qwen3.5:9b
 OLLAMA_THINK=false
 OLLAMA_TEMPERATURE=0
 OLLAMA_NUM_PREDICT=512
+RERANK_ENABLED=false
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+RERANK_MODEL_REVISION=
+RERANK_DEVICE=cpu
+RERANK_CANDIDATES=24
+RERANK_TOP_K=8
 ```
 
 `OLLAMA_THINK` передаётся верхнеуровневым полем `/api/chat`, а остальные два значения —
 через `options`. Пустой ответ считается ошибкой, а `done_reason`, token counts и Ollama
 durations сохраняются в trace.
+
+Reranker загружается лениво только при RERANK_ENABLED=true. Для воспроизводимого
+эксперимента CLIP-005 использована revision
+953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e; без явной revision Hugging Face может
+разрешить более новую версию модели. Reranker работает на CPU и не меняет размещение
+Ollama на GPU.
 
 ### Диагностика TLS timeout
 

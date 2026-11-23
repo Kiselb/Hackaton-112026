@@ -13,7 +13,8 @@
 - **Presentation:** React+TS, two views (search/admin), demo identities.
 - **Application/API:** FastAPI request validation, upload ingestion, query lifecycle, feedback.
 - **Agent:** LangGraph, bounded graph, evidence-based answer synthesis.
-- **Model adapters:** Ollama Qwen3.5-9B, SentenceTransformers BGE-M3 / BGE reranker.
+- **Model adapters:** Ollama Qwen3.5-9B, SentenceTransformers BGE-M3 и опциональный
+  BGE CrossEncoder reranker.
 - **Stores:** Postgres relational source of truth; Qdrant and OpenSearch are rebuildable derived indexes; file storage is filesystem adapter.
 - **Observability:** structured node decisions, retrieval details, token counters, response latency, outcomes; DB for MVP, OTel/MLflow/Langfuse later.
 
@@ -37,8 +38,8 @@ question + user session history
     -> local BGE-M3 embedding
     -> Qdrant dense top-50 + OpenSearch BM25 top-50 per query
     -> RRF, candidate cap 24
-    -> local CrossEncoder rerank
-    -> SQL visibility: status=ready, active=true, effective as-of date
+    -> SQL visibility: status=ready, active=true
+    -> optional local CrossEncoder rerank of active search chunks
     -> distinct parents, up to 8, approximate 5000-token budget
     -> LLM evidence-coverage judge
          -> (insufficient) one targeted query extension, then retrieve again
@@ -48,6 +49,13 @@ question + user session history
 ```
 
 **Evidence is always SQL-filtered** even if stale derived search indexes return older records. Numeric citation ID maps to an immutable search child, whose parent text is displayed with its exact start/end offsets. The generator sees the parent context; the UI highlights the search child.
+
+Reranking is disabled by default and runs only after the PostgreSQL visibility gate.
+It scores child search chunks while preserving their parent/document linkage. Trace
+stores RRF score, CrossEncoder score and ranks before/after. A model load or inference
+error falls back to the original RRF order and records the reason; it cannot reintroduce
+a document removed by the visibility gate. Temporal evidence-gate and citation repair
+remain downstream and unchanged.
 
 Multi-document questions: planner decomposes into separate search forms. In a future iteration, store subquestion-to-document coverage and require one grounded source per subquestion. Current judge may be imperfect.
 

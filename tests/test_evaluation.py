@@ -8,6 +8,7 @@ from clip_agent.evaluation import (
     load_dataset,
     source_id,
 )
+from scripts.evaluate import corpus_manifests_match, digest
 
 
 def case(**overrides):
@@ -73,6 +74,8 @@ def test_loader_rejects_duplicate_ids(tmp_path):
 def test_retrieval_fact_and_citation_metrics():
     result = evaluate_case(case(), response())
     assert result["metrics"]["document_recall_at_5"] == 1.0
+    assert result["metrics"]["document_recall_at_1"] == 0.0
+    assert result["metrics"]["document_recall_at_3"] == 1.0
     assert result["metrics"]["mrr"] == 0.5
     assert result["metrics"]["citation_ids_valid"] is True
     assert result["metrics"]["citations_present"] is True
@@ -127,3 +130,32 @@ def test_aggregate_and_comparison_are_deterministic():
     comparison = compare_runs(run, changed)
     assert comparison["same_dataset"] is True
     assert comparison["metrics"]["mrr"]["delta"] == 0.5
+
+
+def test_ndcg_fragment_and_all_source_coverage():
+    multi = case(
+        expected_sources=["example:order_101", "example:agency_contract"],
+        expected_fragments=["f-order", "f-agency"],
+        relevance_grades={"example:order_101": 3, "example:agency_contract": 2},
+        required_facts=[],
+    )
+    payload = response()
+    payload["sources"][0]["fragment_ids"] = ["f-agency"]
+    payload["sources"][1]["fragment_ids"] = ["f-order"]
+    result = evaluate_case(multi, payload)
+
+    assert result["metrics"]["ndcg_at_5"] < 1.0
+    assert result["metrics"]["all_required_sources_at_8"] is True
+    assert result["metrics"]["expected_fragment_coverage"] == 1.0
+
+
+def test_new_corpus_manifest_accepts_matching_legacy_manifest():
+    files = {"one.txt": "abc"}
+    legacy = {
+        "hash": digest(json.dumps(files, sort_keys=True).encode()),
+        "files": files,
+    }
+    current = {**legacy, "hash": "new", "config_sha256": "config"}
+
+    assert corpus_manifests_match(legacy, current) is True
+    assert corpus_manifests_match({**legacy, "files": {}}, current) is False
