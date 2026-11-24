@@ -1,6 +1,12 @@
 # Uncut demo script (target <= 3:00)
 
-**Pre-flight** (before recording; not part of take): start DB / Qdrant / OpenSearch / Ollama / backend / frontend, download weights, warm CPU reranker and GPU model, load approved corpus, disable browser notifications, zoom UI to readable size, close sensitive tabs. Keep a prepared second tab on admin and a fixed example question. One continuous capture; no editing.
+**Pre-flight** (before recording; not part of take): start DB / Qdrant / OpenSearch /
+Ollama and either the local backend/frontend or the authenticated CLIP-008 stand. For a
+public take, complete backup and the local/external auth checks from
+`docs/CLIP008_PUBLIC_DEMO.md`; never expose Vite or FastAPI directly. Download weights,
+warm CPU reranker and GPU model, load approved corpus, disable browser notifications,
+zoom UI to readable size, close sensitive tabs. Keep a prepared second tab on admin and a
+fixed example question. One continuous capture; no editing.
 
 | Time | Action | Key evidence |
 |---|---|---|

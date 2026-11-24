@@ -19,6 +19,9 @@
 - **Observability:** structured node decisions, retrieval details, token counters, response latency, outcomes; DB for MVP, OTel/MLflow/Langfuse later.
 - **Analytics UI:** deterministic overlapping outcome labels over `SearchTrace`, bounded
   list/detail APIs and trace-linked feedback. No LLM judge is required.
+- **Optional public demo ingress:** ngrok HTTPS termination → loopback-only Caddy with
+  bcrypt Basic Auth → production React files and loopback-only FastAPI. It reuses the
+  same application configuration and stores; it is not another deployment.
 
 ## Ingestion
 
@@ -92,9 +95,23 @@ preserves their citation order and returns page only when it is stored. Raw exce
 is retained in PostgreSQL but redacted from the frontend projection.
 
 `AGENT_DEMO_OVERRIDE_ENABLED=false` is the safe default. When explicitly enabled on a
-loopback-only local demo, `/api/v1/ask` accepts a request-level baseline/agent choice; it
-does not mutate global settings. The response and trace always expose the actual mode, so
-an agent exception followed by baseline fallback is displayed as baseline.
+loopback-only local demo or behind the authenticated CLIP-008 ingress, `/api/v1/ask`
+accepts a request-level baseline/agent choice; it does not mutate global settings. The
+response and trace always expose the actual mode, so an agent exception followed by
+baseline fallback is displayed as baseline.
+
+## Public demo ingress and overload boundary
+
+`PUBLIC_DEMO_ENABLED=true` enables process-local, non-blocking semaphores around the whole
+ask and ingestion request. Capacity comes from `DEMO_MAX_CONCURRENT_LLM` and
+`DEMO_MAX_CONCURRENT_INGEST`; excess work receives HTTP 429 with `Retry-After` rather than
+an unbounded queue. Context-managed release prevents a failed Ollama/indexing call from
+leaking capacity. Upload bytes are bounded independently in Caddy and FastAPI.
+
+Caddy's site-wide route authenticates before any handler, including `/api`, `/healthz`,
+`/readyz`, static files and SPA fallback. It strips `Authorization` before proxying and
+from access logs. Caddy and FastAPI bind only to loopback. ngrok is the only external
+endpoint and terminates TLS, so the tunnel provider remains inside the trust boundary.
 
 ## Document temporality and contradiction
 
@@ -119,4 +136,9 @@ For a small corpus and 100–300 queries/month, indexes and model inference can 
 
 ## Security caveats
 
-No real ACL, authentication, admin protection or user identity verification in MVP; user_id may be spoofed. Data must be synthetic/approved and bound to loopback only. Source text is untrusted data; never allow a retrieved document to change tool permissions. Enforce upload validation, antivirus scans, PDF parsing sandbox, secrets management and role-aware retrieval in production.
+No real ACL or user identity verification exists; `user_id` may be spoofed. The optional
+CLIP-008 ingress supplies only one shared Basic Auth credential and protects admin routes
+at the proxy boundary. Direct FastAPI must remain loopback-only. Data must be approved for
+the ngrok trust boundary. Source text is untrusted data; never allow a retrieved document
+to change tool permissions. Enforce antivirus scans, PDF parsing sandbox, managed secrets,
+rate limiting and role-aware retrieval in production.

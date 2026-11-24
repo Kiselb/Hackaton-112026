@@ -1,0 +1,52 @@
+{
+	auto_https off
+	servers {
+		timeouts {
+			read_body 5m
+			idle 10m
+			write 10m
+		}
+	}
+}
+
+http://:{$DEMO_PROXY_PORT} {
+	bind 127.0.0.1
+	log {
+		output file "{$DEMO_ACCESS_LOG}" {
+			roll_size 10MiB
+			roll_keep 3
+			roll_keep_for 168h
+		}
+		format filter {
+			request>headers>Authorization delete
+			request>headers>Proxy-Authorization delete
+		}
+	}
+
+	route {
+		basic_auth bcrypt "AI-Agent Clip jury demo" {
+			{env.DEMO_AUTH_USERNAME} {env.DEMO_AUTH_PASSWORD_HASH}
+		}
+
+		request_body /api/v1/documents {
+			max_size {$DEMO_MAX_REQUEST_BODY}
+		}
+
+		@backend path /api/* /healthz /readyz
+		handle @backend {
+			reverse_proxy 127.0.0.1:{$DEMO_BACKEND_PORT} {
+				header_up -Authorization
+				transport http {
+					dial_timeout 5s
+					response_header_timeout 10m
+				}
+			}
+		}
+
+		handle {
+			root * "{$DEMO_FRONTEND_ROOT}"
+			try_files {path} /index.html
+			file_server
+		}
+	}
+}

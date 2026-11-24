@@ -4,8 +4,9 @@
 запускаются в Windows, Ollama работает непосредственно в Windows, PostgreSQL, Qdrant и
 OpenSearch могут работать в Docker Desktop/WSL.
 
-> Демонстрационный MVP без аутентификации. Запускайте только на `127.0.0.1` и
-> используйте синтетические или разрешённые документы.
+> Прямой backend остаётся неаутентифицированным и должен слушать только `127.0.0.1`.
+> Для доступа жюри используйте защищённый Caddy + ngrok контур из
+> [docs/CLIP008_PUBLIC_DEMO.md](docs/CLIP008_PUBLIC_DEMO.md) и только разрешённые данные.
 
 ## Реализованный контур
 
@@ -22,6 +23,8 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - React UI поиска, кликабельных источников, feedback и административной аналитики;
 - пагинируемый журнал запросов и viewer фактических LangGraph-траекторий;
 - воспроизводимый smoke-test upload → ask → deactivate → ask → restore → ask.
+- опциональный публичный demo ingress: production React через Caddy Basic Auth и ngrok;
+- неблокирующие конфигурируемые лимиты параллельных ask/ingest в публичном режиме.
 
 Bounded LangGraph agent и CrossEncoder reranker реализованы за независимыми флагами
 и оставлены выключенными по умолчанию. CLIP-006 улучшил корректность отказов, но
@@ -72,7 +75,7 @@ Agent настраивается через `AGENT_ENABLED`, `AGENT_MAX_SEARCH_C
 Для локальной браузерной демонстрации можно отдельно установить
 `AGENT_DEMO_OVERRIDE_ENABLED=true`. Тогда UI показывает request-level выбор режима;
 глобальный `AGENT_ENABLED=false` при этом сохраняется. По умолчанию override выключен,
-не меняет серверную настройку и допустим только на loopback в этом MVP без аутентификации.
+не меняет серверную настройку и допустим на loopback либо за защищённым Caddy ingress.
 
 Backend:
 
@@ -90,6 +93,24 @@ npm run dev
 Открыть `http://127.0.0.1:5173`. Подробные команды создания отдельной базы,
 диагностики портов, Ollama и GPU находятся в
 [docs/LOCAL_SETUP_WINDOWS.md](docs/LOCAL_SETUP_WINDOWS.md).
+
+## Публичный стенд для жюри
+
+CLIP-008 не создаёт вторую конфигурацию или корпус. Существующий backend остаётся на
+loopback; Caddy раздаёт `frontend/dist`, защищает все UI/API/health маршруты одним
+bcrypt Basic Auth и слушает отдельный loopback-порт; ngrok публикует только Caddy.
+
+```powershell
+# После заполнения demo-параметров в существующем .env и создания backup:
+.\scripts\demo\Start-PublicDemo.ps1 -RebuildFrontend
+$credential = Get-Credential -UserName jury
+.\scripts\demo\Test-PublicDemo.ps1 -Credential $credential
+# Остановить проверенный локальный экземпляр по PID, напечатанным launcher-ом.
+.\scripts\demo\Start-PublicDemo.ps1 -StartTunnel
+```
+
+Полная настройка, backup, смена пароля, внешняя проверка и остановка:
+[docs/CLIP008_PUBLIC_DEMO.md](docs/CLIP008_PUBLIC_DEMO.md).
 
 ## Проверки
 
@@ -185,13 +206,13 @@ registry. Для `/api/chat` приложение отправляет конф�
 ## Ограничения
 
 - нет OCR, распознавания таблиц и сканов;
-- нет аутентификации, ACL и production security;
+- прямой FastAPI не имеет аутентификации; публичный demo ingress имеет общий Basic Auth,
+  но не ACL или production security;
 - административные traces доступны глобально в локальном MVP; фильтры не являются ACL;
 - нет очереди ingestion и автоматической reconciliation между тремя хранилищами;
 - evidence assessment и проверка номера цитаты не заменяют экспертную entailment-проверку;
 - baseline измерен на синтетических документах и не является оценкой качества на
   производственном корпусе;
-- frontend доступен только как dev server или собранный `frontend/dist`; раздача
-  production bundle backend-ом не настроена.
+- production bundle раздаётся Caddy только в явно включённом публичном demo-контуре.
 
 Синтетические документы находятся в `examples/`. Они не являются данными организатора.

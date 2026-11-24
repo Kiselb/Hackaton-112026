@@ -492,6 +492,6 @@ export default function App() {
     {tab === "analytics" && <AnalyticsView analytics={analytics} />}
     {tab === "traces" && <TracesView />}
     {tab === "documents" && <DocumentsView documents={documents} busy={documentsBusy} reload={loadDocuments} />}
-    <footer>Локальный демонстрационный MVP · без production-аутентификации и ACL</footer>
+    <footer>Local-first MVP · общий Basic Auth на публичном стенде · без ACL</footer>
   </main>;
 }

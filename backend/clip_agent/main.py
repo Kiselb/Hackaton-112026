@@ -25,9 +25,20 @@ from .chunking import chunk_text
 from .config import get_settings
 from .db import Chunk, Document, SearchTrace, SessionLocal, TraceFeedback, init_db
 from .extract import extract_text
+from .load_control import RequestGate, slot_dependency
 from .search import index_chunks, opensearch, qdrant, retrieve
 
 settings = get_settings()
+llm_gate = RequestGate(
+    settings.demo_max_concurrent_llm,
+    enabled=settings.public_demo_enabled,
+    message="Сервис занят обработкой другого AI-запроса. Повторите попытку позже.",
+)
+ingest_gate = RequestGate(
+    settings.demo_max_concurrent_ingest,
+    enabled=settings.public_demo_enabled,
+    message="Сервис занят индексацией другого документа. Повторите попытку позже.",
+)
 app = FastAPI(title="AI-Agent Clip", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +53,14 @@ app.add_middleware(
 def get_db():
     with SessionLocal() as session:
         yield session
+
+
+def acquire_llm_slot():
+    yield from slot_dependency(llm_gate)
+
+
+def acquire_ingest_slot():
+    yield from slot_dependency(ingest_gate)
 
 
 @app.on_event("startup")
@@ -111,11 +130,17 @@ def check_ollama_model() -> None:
 
 @app.post("/api/v1/documents", status_code=201)
 def upload_document(
-    file: UploadFile = File(...), title: str | None = Form(None), db: Session = Depends(get_db)
+    file: UploadFile = File(...),
+    title: str | None = Form(None),
+    db: Session = Depends(get_db),
+    _slot: None = Depends(acquire_ingest_slot),
 ) -> dict:
-    data = file.file.read()
-    if not data or len(data) > 25 * 1024 * 1024:
-        raise HTTPException(400, "Пустой файл или размер больше 25 MB")
+    max_upload_bytes = settings.demo_max_upload_mb * 1024 * 1024
+    data = file.file.read(max_upload_bytes + 1)
+    if not data:
+        raise HTTPException(400, "Пустой файл")
+    if len(data) > max_upload_bytes:
+        raise HTTPException(413, f"Размер файла больше {settings.demo_max_upload_mb} MB")
     document_id = uuid4()
     suffix = Path(file.filename or "source.txt").suffix.lower()
     storage_key = Path("documents") / str(document_id) / f"source{suffix}"
@@ -197,7 +222,11 @@ def restore(document_id: UUID, db: Session = Depends(get_db)) -> dict:
 
 
 @app.post("/api/v1/ask")
-def ask(payload: AskRequest, db: Session = Depends(get_db)) -> dict:
+def ask(
+    payload: AskRequest,
+    db: Session = Depends(get_db),
+    _slot: None = Depends(acquire_llm_slot),
+) -> dict:
     if payload.mode is not None and not settings.agent_demo_override_enabled:
         raise HTTPException(403, "Request-level demo mode is disabled")
     use_agent = settings.agent_enabled
