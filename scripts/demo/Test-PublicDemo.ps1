@@ -19,7 +19,10 @@ function Get-Status {
     param([string]$Method, [string]$Uri, [hashtable]$Headers, [string]$Body = $null)
     try {
         $arguments = @{ Method = $Method; Uri = $Uri; Headers = $Headers; UseBasicParsing = $true; TimeoutSec = 20 }
-        if ($null -ne $Body) { $arguments.Body = $Body; $arguments.ContentType = "application/json" }
+        if ($Method -ne "GET" -and $null -ne $Body) {
+            $arguments.Body = $Body
+            $arguments.ContentType = "application/json"
+        }
         return [int](Invoke-WebRequest @arguments).StatusCode
     } catch {
         if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode }
