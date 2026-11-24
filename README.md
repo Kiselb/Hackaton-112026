@@ -112,6 +112,18 @@ $credential = Get-Credential -UserName jury
 Полная настройка, backup, смена пароля, внешняя проверка и остановка:
 [docs/CLIP008_PUBLIC_DEMO.md](docs/CLIP008_PUBLIC_DEMO.md).
 
+Verified backup основных PostgreSQL/Qdrant/OpenSearch/storage ресурсов выполняется
+fail-closed процедурой CLIP-009. Сначала обязателен read-only preflight; без настроенного
+OpenSearch snapshot repository backup не начинается:
+
+```powershell
+.\scripts\backup\Backup-Clip.ps1 -Preflight
+.\scripts\backup\Backup-Clip.ps1 -Backup
+```
+
+Runbook, ограничения согласованности и план изолированного восстановления:
+[docs/CLIP009_BACKUP.md](docs/CLIP009_BACKUP.md).
+
 ## Проверки
 
 ```powershell
