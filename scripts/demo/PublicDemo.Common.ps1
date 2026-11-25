@@ -113,6 +113,41 @@ function ConvertFrom-DemoJson {
     }
 }
 
+function Invoke-DemoPythonProbe {
+    param(
+        [string]$PythonPath,
+        [string]$Probe,
+        [scriptblock]$Runner = $null
+    )
+
+    if ($null -ne $Runner) {
+        $result = Invoke-DemoCommand $PythonPath @("-c", $Probe) $Runner
+    } else {
+        # Windows PowerShell 5.1 turns native stderr into non-terminating ErrorRecord
+        # objects. Capture those records and the native exit code here without changing
+        # the error handling used by Tailscale commands.
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            $output = @(& $PythonPath "-c" $Probe 2>&1)
+            $exitCode = [int]$LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        $result = [pscustomobject]@{
+            ExitCode = $exitCode
+            Output = @($output | ForEach-Object { [string]$_ })
+        }
+    }
+
+    if ($result.ExitCode -ne 0) {
+        $diagnostic = (($result.Output -join "`n").Trim())
+        if ([string]::IsNullOrWhiteSpace($diagnostic)) { $diagnostic = "no output" }
+        throw "Project Python runtime probe failed with exit code $($result.ExitCode): $diagnostic"
+    }
+    return @($result.Output | ForEach-Object { [string]$_ })
+}
+
 function Get-DemoPythonRuntimeIdentity {
     param(
         [string]$PythonPath,
@@ -132,18 +167,15 @@ function Get-DemoPythonRuntimeIdentity {
     $probe = @'
 import json, sys
 print(json.dumps({
-    "version": f"{sys.version_info.major}.{sys.version_info.minor}",
-    "executable": sys.executable,
-    "base_executable": getattr(sys, "_base_executable", ""),
-    "prefix": sys.prefix,
-    "base_prefix": sys.base_prefix,
+    'version': f'{sys.version_info.major}.{sys.version_info.minor}',
+    'executable': sys.executable,
+    'base_executable': getattr(sys, '_base_executable', ''),
+    'prefix': sys.prefix,
+    'base_prefix': sys.base_prefix,
 }))
 '@
-    $result = Invoke-DemoCommand $python @("-c", $probe) $Runner
-    if ($result.ExitCode -ne 0) {
-        throw "Cannot inspect the project Python runtime: $(($result.Output -join ' ').Trim())"
-    }
-    $runtime = ConvertFrom-DemoJson $result.Output "Project Python runtime probe"
+    $probeOutput = Invoke-DemoPythonProbe $python $probe $Runner
+    $runtime = ConvertFrom-DemoJson $probeOutput "Project Python runtime probe"
     foreach ($property in @("version", "executable", "base_executable", "prefix", "base_prefix")) {
         if ($null -eq $runtime.PSObject.Properties[$property] -or
             [string]::IsNullOrWhiteSpace([string]$runtime.$property)) {

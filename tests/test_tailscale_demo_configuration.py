@@ -325,6 +325,73 @@ if (-not $failedClosed) {{ throw 'Python runtime outside the project venv was ac
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_windows_powershell_51_real_project_python_probe() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell 5.1 is not available")
+
+    project_python = ROOT / ".venv" / "Scripts" / "python.exe"
+    project_venv = ROOT / ".venv"
+    if not project_python.is_file():
+        pytest.skip("The project Windows virtual environment is not available")
+
+    common_path = str(DEMO / "PublicDemo.Common.ps1").replace("'", "''")
+    python_path = str(project_python).replace("'", "''")
+    venv_path = str(project_venv).replace("'", "''")
+    command = rf"""
+$ErrorActionPreference = 'Stop'
+. '{common_path}'
+
+$runtime = Get-DemoPythonRuntimeIdentity '{python_path}' '{venv_path}'
+if (-not (Test-DemoPathEqual $runtime.VenvExecutable '{python_path}')) {{
+    throw 'The real probe returned an unexpected venv executable.'
+}}
+if (-not (Test-Path -LiteralPath $runtime.BaseExecutable -PathType Leaf)) {{
+    throw 'The real probe returned a missing base executable.'
+}}
+if ($runtime.AllowedExecutables.Count -ne 2 -or
+    -not (Test-DemoPathAllowed $runtime.VenvExecutable $runtime.AllowedExecutables) -or
+    -not (Test-DemoPathAllowed $runtime.BaseExecutable $runtime.AllowedExecutables)) {{
+    throw 'The real probe did not return both allowed executables.'
+}}
+
+$detailsProbe = "import json, sys; print(json.dumps({{'version': str(sys.version_info.major) + '.' + str(sys.version_info.minor), 'prefix': sys.prefix, 'base_prefix': sys.base_prefix}}))"
+$detailsOutput = @(Invoke-DemoPythonProbe '{python_path}' $detailsProbe)
+$details = ConvertFrom-DemoJson $detailsOutput 'Real project Python integration probe'
+if ([string]$details.version -cne '3.12') {{
+    throw 'The real probe did not use Python 3.12.'
+}}
+if (-not (Test-DemoPathEqual ([string]$details.prefix) '{venv_path}') -or
+    (Test-DemoPathEqual ([string]$details.prefix) ([string]$details.base_prefix))) {{
+    throw 'The real probe did not use the project virtual environment.'
+}}
+
+$badProbe = "import sys; sys.stderr.write('clip010-probe-stderr'); raise SystemExit(7)"
+$failedClosed = $false
+try {{
+    Invoke-DemoPythonProbe '{python_path}' $badProbe | Out-Null
+}} catch {{
+    $message = [string]$_.Exception.Message
+    if ($message -notmatch 'exit code 7' -or $message -notmatch 'clip010-probe-stderr') {{
+        throw "The failing real probe lost its exit code or stderr: $message"
+    }}
+    $failedClosed = $true
+}}
+if (-not $failedClosed) {{ throw 'A failing real Python probe was accepted.' }}
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_tailscale_lifecycle_scripts_are_fail_closed_and_ngrok_free() -> None:
     start = (DEMO / "Start-PublicDemo.ps1").read_text(encoding="utf-8")
     status = (DEMO / "Get-PublicDemoStatus.ps1").read_text(encoding="utf-8")
@@ -336,6 +403,9 @@ def test_tailscale_lifecycle_scripts_are_fail_closed_and_ngrok_free() -> None:
     assert 'Resolve-DemoExecutable "tailscale.exe"' in start
     assert "Start-TailscaleDemoFunnel" in start
     assert "Get-DemoPythonRuntimeIdentity" in start
+    assert "Invoke-DemoPythonProbe" in common
+    assert "'base_executable': getattr(sys, '_base_executable', '')" in common
+    assert '"base_executable": getattr(sys, "_base_executable", "")' not in common
     assert "New-DemoProcessRecord $backendSnapshot" in start
     assert "if (-not $backendOwned) { $state.backend = $null }" in start
     assert "Stop-PublicDemo.ps1 will not disable it" in start

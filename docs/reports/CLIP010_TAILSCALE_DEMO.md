@@ -121,3 +121,20 @@ allow-list и не может принять произвольный Python-п�
 Ruff и Windows PowerShell 5.1 parser успешно, `pip check` без нарушений. Реальный
 Start/Stop lifecycle не запускался. Read-only проверка PID `92960` дала
 `IdentityValid=True`, `ReuseUnmanaged`, health/readiness `200/200`.
+
+## CLIP-010-HOTFIX — Windows PowerShell 5.1 Python probe quoting
+
+Windows PowerShell 5.1 удалял внутренние двойные кавычки из многострочного
+аргумента `python -c`; Python получал повреждённый словарь и завершался с
+`SyntaxError`. Python-литералы probe заменены на одинарные. Его вызов выделен в
+отдельную функцию, которая локально собирает native stderr и exit code, не меняя
+общий runner и поведение команд Tailscale. При ненулевом exit code диагностика
+содержит и код, и фактический stderr.
+
+Настоящий integration-тест запускает функцию через Windows PowerShell 5.1 и
+проектный `.venv\Scripts\python.exe`, подтверждает Python 3.12, отличающиеся
+`sys.prefix`/`sys.base_prefix` и оба разрешённых executable. Негативный probe с
+exit code `7` подтверждает сохранение stderr. Результаты: профиль `8 passed`,
+полный pytest `62 passed`, Ruff/parser/git diff check успешно, `pip check` без
+нарушений. Выполнялась только read-only Python identity проверка; Start/Stop и
+операции Tailscale не запускались.
