@@ -89,6 +89,13 @@ fail-closed ошибке.
 путь executable, UTC-время старта, роль и сигнатура команды. Существующий ручной
 Funnel автоматически не принимается под управление.
 
+На Windows проектная Python 3.12 `.venv` может сообщать в `Win32_Process` как
+собственный `sys.executable`, так и связанный `sys._base_executable`. Оба пути
+получаются запуском Python именно из `.venv`; произвольный `python.exe` из PATH не
+принимается. Для нового FastAPI ownership записывается из фактического snapshot
+владельца loopback-порта после проверки PID, executable и command line, а не из
+предполагаемого пути launcher-а.
+
 ## Статус и публичная проверка
 
 ```powershell

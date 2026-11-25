@@ -53,6 +53,28 @@ function Resolve-DemoExecutable {
     throw "Required command is not installed or was not found: $Name"
 }
 
+function Test-DemoPathEqual {
+    param([string]$Left, [string]$Right)
+
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
+        return $false
+    }
+    return [string]::Equals(
+        [IO.Path]::GetFullPath($Left),
+        [IO.Path]::GetFullPath($Right),
+        [StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Test-DemoPathAllowed {
+    param([string]$Path, [string[]]$AllowedPaths)
+
+    foreach ($allowedPath in @($AllowedPaths)) {
+        if (Test-DemoPathEqual $Path $allowedPath) { return $true }
+    }
+    return $false
+}
+
 function Invoke-DemoCommand {
     param(
         [string]$Executable,
@@ -88,6 +110,73 @@ function ConvertFrom-DemoJson {
         return ConvertFrom-Json -InputObject $text -ErrorAction Stop
     } catch {
         throw "$Description returned invalid JSON."
+    }
+}
+
+function Get-DemoPythonRuntimeIdentity {
+    param(
+        [string]$PythonPath,
+        [string]$VenvRoot,
+        [scriptblock]$Runner = $null
+    )
+
+    $python = [IO.Path]::GetFullPath($PythonPath)
+    $venv = [IO.Path]::GetFullPath($VenvRoot).TrimEnd('\', '/')
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        throw "Project virtual environment Python does not exist: $python"
+    }
+    if (-not (Test-Path -LiteralPath $venv -PathType Container)) {
+        throw "Project virtual environment does not exist: $venv"
+    }
+
+    $probe = @'
+import json, sys
+print(json.dumps({
+    "version": f"{sys.version_info.major}.{sys.version_info.minor}",
+    "executable": sys.executable,
+    "base_executable": getattr(sys, "_base_executable", ""),
+    "prefix": sys.prefix,
+    "base_prefix": sys.base_prefix,
+}))
+'@
+    $result = Invoke-DemoCommand $python @("-c", $probe) $Runner
+    if ($result.ExitCode -ne 0) {
+        throw "Cannot inspect the project Python runtime: $(($result.Output -join ' ').Trim())"
+    }
+    $runtime = ConvertFrom-DemoJson $result.Output "Project Python runtime probe"
+    foreach ($property in @("version", "executable", "base_executable", "prefix", "base_prefix")) {
+        if ($null -eq $runtime.PSObject.Properties[$property] -or
+            [string]::IsNullOrWhiteSpace([string]$runtime.$property)) {
+            throw "Project Python runtime probe did not return '$property'."
+        }
+    }
+    if ([string]$runtime.version -cne "3.12") {
+        throw "The project virtual environment must use Python 3.12."
+    }
+
+    $venvExecutable = [IO.Path]::GetFullPath([string]$runtime.executable)
+    $baseExecutable = [IO.Path]::GetFullPath([string]$runtime.base_executable)
+    $runtimePrefix = [IO.Path]::GetFullPath([string]$runtime.prefix).TrimEnd('\', '/')
+    $basePrefix = [IO.Path]::GetFullPath([string]$runtime.base_prefix).TrimEnd('\', '/')
+    if (-not (Test-DemoPathEqual $venvExecutable $python) -or
+        -not (Test-DemoPathEqual $runtimePrefix $venv)) {
+        throw "Python runtime does not belong to the project virtual environment."
+    }
+    if (Test-DemoPathEqual $runtimePrefix $basePrefix) {
+        throw "Project Python is not running from a virtual environment."
+    }
+    if (-not (Test-Path -LiteralPath $venvExecutable -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $baseExecutable -PathType Leaf)) {
+        throw "Project Python runtime reported a missing executable."
+    }
+    if (-not (Test-DemoPathEqual (Split-Path -Parent $baseExecutable) $basePrefix)) {
+        throw "Project Python base executable does not match sys.base_prefix."
+    }
+
+    return [pscustomobject]@{
+        VenvExecutable = $venvExecutable
+        BaseExecutable = $baseExecutable
+        AllowedExecutables = @(@($venvExecutable, $baseExecutable) | Select-Object -Unique)
     }
 }
 
@@ -308,6 +397,11 @@ function Get-DemoListenerOwner {
     $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
     if ($listeners.Count -gt 1) { throw "Multiple listeners were found on port $Port." }
     if ($listeners.Count -eq 0) { return $null }
+    $address = $null
+    if (-not [Net.IPAddress]::TryParse([string]$listeners[0].LocalAddress, [ref]$address) -or
+        -not [Net.IPAddress]::IsLoopback($address)) {
+        throw "Port $Port is not bound exclusively to loopback."
+    }
     return [int]$listeners[0].OwningProcess
 }
 
@@ -329,14 +423,54 @@ function Get-DemoProcessSnapshot {
 }
 
 function New-DemoProcessRecord {
-    param([object]$Process, [string]$Executable, [string]$Role, [string[]]$CommandTokens)
+    param([object]$Snapshot, [string]$Role, [string[]]$CommandTokens)
 
-    return [ordered]@{
-        pid = [int]$Process.Id
-        executable = [IO.Path]::GetFullPath($Executable)
-        started_utc = $Process.StartTime.ToUniversalTime().ToString("o")
+    if ($null -eq $Snapshot -or [int]$Snapshot.ProcessId -lt 1 -or
+        [string]::IsNullOrWhiteSpace([string]$Snapshot.ExecutablePath) -or
+        [string]::IsNullOrWhiteSpace([string]$Snapshot.StartedUtc) -or
+        [string]::IsNullOrWhiteSpace([string]$Snapshot.CommandLine)) {
+        throw "Cannot create lifecycle ownership from an incomplete process snapshot."
+    }
+    try { $startedUtc = [datetime]::Parse([string]$Snapshot.StartedUtc).ToUniversalTime().ToString("o") }
+    catch { throw "Cannot create lifecycle ownership from an invalid process start time." }
+
+    return [pscustomobject][ordered]@{
+        pid = [int]$Snapshot.ProcessId
+        executable = [IO.Path]::GetFullPath([string]$Snapshot.ExecutablePath)
+        started_utc = $startedUtc
         role = $Role
         command_tokens = @($CommandTokens)
+    }
+}
+
+function Test-DemoProcessSnapshot {
+    param([object]$Actual, [string[]]$AllowedExecutables, [string[]]$CommandTokens)
+
+    if ($null -eq $Actual) {
+        return [pscustomobject]@{ Valid = $false; Reason = "process is not running" }
+    }
+    if (-not (Test-DemoPathAllowed ([string]$Actual.ExecutablePath) $AllowedExecutables)) {
+        return [pscustomobject]@{ Valid = $false; Reason = "executable path mismatch" }
+    }
+    foreach ($token in @($CommandTokens)) {
+        if ([string]$Actual.CommandLine -notlike "*$token*") {
+            return [pscustomobject]@{ Valid = $false; Reason = "command line mismatch" }
+        }
+    }
+    return [pscustomobject]@{ Valid = $true; Reason = "matched" }
+}
+
+function Assert-DemoExpectedProcessSnapshot {
+    param(
+        [object]$Snapshot,
+        [string[]]$AllowedExecutables,
+        [string[]]$CommandTokens,
+        [string]$Role
+    )
+
+    $identity = Test-DemoProcessSnapshot $Snapshot $AllowedExecutables $CommandTokens
+    if (-not [bool]$identity.Valid) {
+        throw "$Role port is owned by an unexpected process ($($identity.Reason))."
     }
 }
 
@@ -347,9 +481,8 @@ function Test-DemoProcessIdentity {
     if ([int]$Record.pid -ne [int]$Actual.ProcessId) {
         return [pscustomobject]@{ Valid = $false; Reason = "PID mismatch" }
     }
-    $expectedExecutable = [IO.Path]::GetFullPath([string]$Record.executable)
     if ([string]::IsNullOrWhiteSpace([string]$Actual.ExecutablePath) -or
-        [IO.Path]::GetFullPath([string]$Actual.ExecutablePath) -cne $expectedExecutable) {
+        -not (Test-DemoPathEqual ([string]$Actual.ExecutablePath) ([string]$Record.executable))) {
         return [pscustomobject]@{ Valid = $false; Reason = "executable path mismatch" }
     }
     try {
@@ -373,7 +506,7 @@ function Assert-DemoProcessRecordContract {
     param(
         [object]$Record,
         [string]$ExpectedRole,
-        [string]$ExpectedExecutable,
+        [string[]]$AllowedExecutables,
         [string[]]$ExpectedCommandTokens
     )
 
@@ -384,8 +517,7 @@ function Assert-DemoProcessRecordContract {
     }
     if ($null -eq $Record.PSObject.Properties['executable'] -or
         [string]::IsNullOrWhiteSpace([string]$Record.executable) -or
-        [IO.Path]::GetFullPath([string]$Record.executable) -cne
-            [IO.Path]::GetFullPath($ExpectedExecutable)) {
+        -not (Test-DemoPathAllowed ([string]$Record.executable) $AllowedExecutables)) {
         throw "$ExpectedRole lifecycle record has an unexpected executable."
     }
     $actualTokens = @($Record.command_tokens)
@@ -396,6 +528,27 @@ function Assert-DemoProcessRecordContract {
         if ([string]$actualTokens[$index] -cne [string]$ExpectedCommandTokens[$index]) {
             throw "$ExpectedRole lifecycle record has unexpected command tokens."
         }
+    }
+}
+
+function Assert-DemoOwnedListenerIdentity {
+    param(
+        [object]$Record,
+        [object]$Actual,
+        [int]$ListenerPid,
+        [string]$ExpectedRole,
+        [string[]]$AllowedExecutables,
+        [string[]]$ExpectedCommandTokens
+    )
+
+    Assert-DemoProcessRecordContract `
+        $Record $ExpectedRole $AllowedExecutables $ExpectedCommandTokens
+    $identity = Test-DemoProcessIdentity $Record $Actual
+    if (-not [bool]$identity.Valid) {
+        throw "$ExpectedRole PID $($Record.pid) failed ownership validation ($($identity.Reason))."
+    }
+    if ([int]$Record.pid -ne $ListenerPid) {
+        throw "$ExpectedRole PID $($Record.pid) no longer owns the expected listener."
     }
 }
 

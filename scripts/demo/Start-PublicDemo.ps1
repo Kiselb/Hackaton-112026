@@ -19,34 +19,18 @@ $caddyFile = Join-Path $PSScriptRoot "Caddyfile"
 $logDir = Join-Path $repoRoot "storage\demo-logs"
 $statePath = Get-DemoStatePath $repoRoot
 
-function Assert-ExpectedProcessSnapshot {
-    param([object]$Snapshot, [string]$Executable, [string[]]$CommandTokens, [string]$Role)
-
-    if ($null -eq $Snapshot) { throw "$Role listener process could not be inspected." }
-    $expectedPath = [IO.Path]::GetFullPath($Executable)
-    if ([string]::IsNullOrWhiteSpace([string]$Snapshot.ExecutablePath) -or
-        [IO.Path]::GetFullPath([string]$Snapshot.ExecutablePath) -cne $expectedPath) {
-        throw "$Role port is owned by an unexpected executable."
-    }
-    foreach ($token in $CommandTokens) {
-        if ([string]$Snapshot.CommandLine -notlike "*$token*") {
-            throw "$Role port is owned by a process with an unexpected command line."
-        }
-    }
-}
-
 function Test-StateOwnsProcess {
     param(
         [object]$Record,
         [object]$Snapshot,
         [int]$ListenerPid,
         [string]$Role,
-        [string]$Executable,
+        [string[]]$AllowedExecutables,
         [string[]]$CommandTokens
     )
 
     if ($null -eq $Record -or [int]$Record.pid -ne $ListenerPid) { return $false }
-    Assert-DemoProcessRecordContract $Record $Role $Executable $CommandTokens
+    Assert-DemoProcessRecordContract $Record $Role $AllowedExecutables $CommandTokens
     $identity = Test-DemoProcessIdentity $Record $Snapshot
     return [bool]$identity.Valid
 }
@@ -80,13 +64,8 @@ $expectedFunnelUrl = ConvertTo-DemoHttpsOrigin ([string]$env:TAILSCALE_FUNNEL_UR
 
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw "Project .venv is missing." }
-$pythonVersion = & $python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne "3.12") { throw "The project .venv must use Python 3.12." }
-$pythonProcessExecutable = (& $python -c "import sys; print(sys.executable)").Trim()
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $pythonProcessExecutable -PathType Leaf)) {
-    throw "Cannot resolve the Python executable used by the project .venv."
-}
-$pythonProcessExecutable = [IO.Path]::GetFullPath($pythonProcessExecutable)
+$pythonIdentity = Get-DemoPythonRuntimeIdentity $python (Join-Path $repoRoot ".venv")
+$pythonAllowedExecutables = @($pythonIdentity.AllowedExecutables)
 
 $caddy = Resolve-DemoExecutable "caddy" "" @()
 $caddyVersionText = (& $caddy version) -join " "
@@ -149,9 +128,11 @@ try {
     $backendListenerPid = Get-DemoListenerOwner $backendPort
     if ($null -ne $backendListenerPid) {
         $backendSnapshot = Get-DemoProcessSnapshot $backendListenerPid
-        Assert-ExpectedProcessSnapshot $backendSnapshot $pythonProcessExecutable $backendTokens "FastAPI"
+        Assert-DemoExpectedProcessSnapshot `
+            $backendSnapshot $pythonAllowedExecutables $backendTokens "FastAPI"
         $backendOwned = Test-StateOwnsProcess `
-            $state.backend $backendSnapshot $backendListenerPid "backend" $pythonProcessExecutable $backendTokens
+            $state.backend $backendSnapshot $backendListenerPid `
+            "backend" $pythonAllowedExecutables $backendTokens
         $backendAction = Resolve-DemoComponentAction $true $true $backendOwned
         if (-not $backendOwned) { $state.backend = $null }
         Wait-DemoHttpStatus "http://127.0.0.1:$backendPort/healthz" 200
@@ -165,16 +146,26 @@ try {
         ) -WorkingDirectory $repoRoot -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr `
             -WindowStyle Hidden -PassThru
         Wait-DemoHttpStatus "http://127.0.0.1:$backendPort/healthz" 200
-        $state.backend = New-DemoProcessRecord $startedBackend $pythonProcessExecutable "backend" $backendTokens
-        Write-Host "FastAPI started; PID $($startedBackend.Id)."
+        $backendListenerPid = Get-DemoListenerOwner $backendPort
+        if ($null -eq $backendListenerPid -or [int]$backendListenerPid -ne [int]$startedBackend.Id) {
+            throw "New FastAPI process does not own the expected listener."
+        }
+        $backendSnapshot = Get-DemoProcessSnapshot $backendListenerPid
+        Assert-DemoExpectedProcessSnapshot `
+            $backendSnapshot $pythonAllowedExecutables $backendTokens "FastAPI"
+        $state.backend = New-DemoProcessRecord $backendSnapshot "backend" $backendTokens
+        Assert-DemoOwnedListenerIdentity `
+            $state.backend $backendSnapshot $backendListenerPid `
+            "backend" $pythonAllowedExecutables $backendTokens
+        Write-Host "FastAPI started; PID $backendListenerPid."
     }
 
     $caddyListenerPid = Get-DemoListenerOwner $proxyPort
     if ($null -ne $caddyListenerPid) {
         $caddySnapshot = Get-DemoProcessSnapshot $caddyListenerPid
-        Assert-ExpectedProcessSnapshot $caddySnapshot $caddy $caddyTokens "Caddy"
+        Assert-DemoExpectedProcessSnapshot $caddySnapshot @($caddy) $caddyTokens "Caddy"
         $caddyOwned = Test-StateOwnsProcess `
-            $state.caddy $caddySnapshot $caddyListenerPid "caddy" $caddy $caddyTokens
+            $state.caddy $caddySnapshot $caddyListenerPid "caddy" @($caddy) $caddyTokens
         $caddyAction = Resolve-DemoComponentAction $true $true $caddyOwned
         if (-not $caddyOwned) { $state.caddy = $null }
         Wait-DemoHttpStatus "http://127.0.0.1:$proxyPort/healthz" 401
@@ -187,8 +178,16 @@ try {
         ) -WorkingDirectory $repoRoot -RedirectStandardOutput $caddyOut -RedirectStandardError $caddyErr `
             -WindowStyle Hidden -PassThru
         Wait-DemoHttpStatus "http://127.0.0.1:$proxyPort/healthz" 401
-        $state.caddy = New-DemoProcessRecord $startedCaddy $caddy "caddy" $caddyTokens
-        Write-Host "Caddy started; PID $($startedCaddy.Id)."
+        $caddyListenerPid = Get-DemoListenerOwner $proxyPort
+        if ($null -eq $caddyListenerPid -or [int]$caddyListenerPid -ne [int]$startedCaddy.Id) {
+            throw "New Caddy process does not own the expected listener."
+        }
+        $caddySnapshot = Get-DemoProcessSnapshot $caddyListenerPid
+        Assert-DemoExpectedProcessSnapshot $caddySnapshot @($caddy) $caddyTokens "Caddy"
+        $state.caddy = New-DemoProcessRecord $caddySnapshot "caddy" $caddyTokens
+        Assert-DemoOwnedListenerIdentity `
+            $state.caddy $caddySnapshot $caddyListenerPid "caddy" @($caddy) $caddyTokens
+        Write-Host "Caddy started; PID $caddyListenerPid."
     }
 
     $readyStatus = Get-DemoHttpStatus "http://127.0.0.1:$backendPort/readyz" 15

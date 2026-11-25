@@ -19,17 +19,15 @@ if ($null -eq $state) {
 
 $backendTokens = @("uvicorn", "clip_agent.main:app", "--host", "127.0.0.1", "--port", [string]$backendPort)
 $caddyTokens = @("run", "scripts/demo/Caddyfile", "caddyfile")
-$pythonProcessExecutable = ""
+$pythonAllowedExecutables = @()
 $caddy = ""
 if ($null -ne $state.backend) {
     $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
         throw "Project .venv is missing; nothing was stopped."
     }
-    $pythonProcessExecutable = (& $python -c "import sys; print(sys.executable)").Trim()
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $pythonProcessExecutable -PathType Leaf)) {
-        throw "Cannot resolve the project Python executable; nothing was stopped."
-    }
+    $pythonIdentity = Get-DemoPythonRuntimeIdentity $python (Join-Path $repoRoot ".venv")
+    $pythonAllowedExecutables = @($pythonIdentity.AllowedExecutables)
 }
 if ($null -ne $state.caddy) {
     $caddy = Resolve-DemoExecutable "caddy" "" @()
@@ -40,12 +38,12 @@ function Get-OwnedStopPlan {
         [object]$Record,
         [int]$Port,
         [string]$Role,
-        [string]$Executable,
+        [string[]]$AllowedExecutables,
         [string[]]$CommandTokens
     )
 
     if ($null -eq $Record) { return [pscustomobject]@{ Action = "None"; Pid = $null } }
-    Assert-DemoProcessRecordContract $Record $Role $Executable $CommandTokens
+    Assert-DemoProcessRecordContract $Record $Role $AllowedExecutables $CommandTokens
     $recordPid = [int]$Record.pid
     $listenerPid = Get-DemoListenerOwner $Port
     $actual = Get-DemoProcessSnapshot $recordPid
@@ -55,20 +53,18 @@ function Get-OwnedStopPlan {
         }
         return [pscustomobject]@{ Action = "AlreadyStopped"; Pid = $recordPid }
     }
-    $identity = Test-DemoProcessIdentity $Record $actual
-    if (-not [bool]$identity.Valid) {
-        throw "$Role PID $recordPid failed ownership validation ($($identity.Reason)); no process was stopped."
-    }
-    if ($null -eq $listenerPid -or [int]$listenerPid -ne $recordPid) {
+    if ($null -eq $listenerPid) {
         throw "$Role PID $recordPid no longer owns expected port $Port; no process was stopped."
     }
+    Assert-DemoOwnedListenerIdentity `
+        $Record $actual $listenerPid $Role $AllowedExecutables $CommandTokens
     return [pscustomobject]@{ Action = "Stop"; Pid = $recordPid }
 }
 
 # Validate every process before changing Funnel or stopping anything.
-$caddyPlan = Get-OwnedStopPlan $state.caddy $proxyPort "caddy" $caddy $caddyTokens
+$caddyPlan = Get-OwnedStopPlan $state.caddy $proxyPort "caddy" @($caddy) $caddyTokens
 $backendPlan = Get-OwnedStopPlan `
-    $state.backend $backendPort "backend" $pythonProcessExecutable $backendTokens
+    $state.backend $backendPort "backend" $pythonAllowedExecutables $backendTokens
 
 $tailscale = $null
 $funnelResolution = $null

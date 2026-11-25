@@ -101,3 +101,23 @@ startup/stop lifecycle не выполнялся, поэтому эксплуа�
   разрешение владельца и допустимо краткое окно недоступности.
 
 Процедура перехода и rollback: [CLIP010_TAILSCALE_DEMO.md](../CLIP010_TAILSCALE_DEMO.md).
+
+## CLIP-010-FIX — Windows venv process identity
+
+Windows `Win32_Process.ExecutablePath` для Python 3.12 может сообщать базовый
+`Python312\python.exe`, хотя launcher использует `.venv\Scripts\python.exe`.
+Допустимые пути теперь берутся только из `sys.executable` и
+`sys._base_executable`, полученных запуском Python проектной `.venv`; дополнительно
+проверяются Python 3.12, `sys.prefix`, `sys.base_prefix` и существование файлов.
+
+Существующий FastAPI принимается только при совпадении одного из этих путей,
+loopback listener, ожидаемых command tokens и health/readiness, но остаётся
+unmanaged. Для вновь запущенного FastAPI ownership создаётся из фактического
+`Win32_Process` snapshot владельца порта и сразу повторно проверяется по PID,
+executable, времени старта, command line и listener PID. Stop использует тот же
+allow-list и не может принять произвольный Python-процесс или подменённый state.
+
+Проверки исправления: профильные тесты `7 passed`, полный pytest `61 passed`,
+Ruff и Windows PowerShell 5.1 parser успешно, `pip check` без нарушений. Реальный
+Start/Stop lifecycle не запускался. Read-only проверка PID `92960` дала
+`IdentityValid=True`, `ReuseUnmanaged`, health/readiness `200/200`.
