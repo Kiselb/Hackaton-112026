@@ -19,7 +19,7 @@
 - **Observability:** structured node decisions, retrieval details, token counters, response latency, outcomes; DB for MVP, OTel/MLflow/Langfuse later.
 - **Analytics UI:** deterministic overlapping outcome labels over `SearchTrace`, bounded
   list/detail APIs and trace-linked feedback. No LLM judge is required.
-- **Optional public demo ingress:** ngrok HTTPS termination → loopback-only Caddy with
+- **Optional public demo ingress:** Tailscale Funnel HTTPS termination → loopback-only Caddy with
   bcrypt Basic Auth → production React files and loopback-only FastAPI. It reuses the
   same application configuration and stores; it is not another deployment.
 
@@ -110,8 +110,9 @@ leaking capacity. Upload bytes are bounded independently in Caddy and FastAPI.
 
 Caddy's site-wide route authenticates before any handler, including `/api`, `/healthz`,
 `/readyz`, static files and SPA fallback. It strips `Authorization` before proxying and
-from access logs. Caddy and FastAPI bind only to loopback. ngrok is the only external
-endpoint and terminates TLS, so the tunnel provider remains inside the trust boundary.
+from access logs. Caddy and FastAPI bind only to loopback. Tailscale Funnel is the only
+external endpoint and terminates TLS, so the transport provider remains inside the trust
+boundary. Tailscale Serve is private to the tailnet and is not used as a public substitute.
 
 ## Document temporality and contradiction
 
@@ -139,6 +140,6 @@ For a small corpus and 100–300 queries/month, indexes and model inference can 
 No real ACL or user identity verification exists; `user_id` may be spoofed. The optional
 CLIP-008 ingress supplies only one shared Basic Auth credential and protects admin routes
 at the proxy boundary. Direct FastAPI must remain loopback-only. Data must be approved for
-the ngrok trust boundary. Source text is untrusted data; never allow a retrieved document
+the Tailscale Funnel trust boundary. Source text is untrusted data; never allow a retrieved document
 to change tool permissions. Enforce antivirus scans, PDF parsing sandbox, managed secrets,
 rate limiting and role-aware retrieval in production.

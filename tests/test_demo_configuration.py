@@ -28,7 +28,8 @@ def test_example_configuration_contains_no_demo_secret() -> None:
     assert values["PUBLIC_DEMO_ENABLED"] == "false"
     assert values["DEMO_AUTH_USERNAME"] == "jury"
     assert values["DEMO_AUTH_PASSWORD_HASH"] == ""
-    assert values["NGROK_DOMAIN"] == ""
+    assert values["DEMO_TUNNEL_PROVIDER"] == "tailscale"
+    assert values["TAILSCALE_FUNNEL_URL"] == ""
 
 
 def test_proxy_check_covers_every_sensitive_route_family() -> None:

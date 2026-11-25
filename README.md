@@ -5,8 +5,8 @@
 OpenSearch могут работать в Docker Desktop/WSL.
 
 > Прямой backend остаётся неаутентифицированным и должен слушать только `127.0.0.1`.
-> Для доступа жюри используйте защищённый Caddy + ngrok контур из
-> [docs/CLIP008_PUBLIC_DEMO.md](docs/CLIP008_PUBLIC_DEMO.md) и только разрешённые данные.
+> Для доступа жюри используйте защищённый Caddy + Tailscale Funnel контур из
+> [docs/CLIP010_TAILSCALE_DEMO.md](docs/CLIP010_TAILSCALE_DEMO.md) и только разрешённые данные.
 
 ## Реализованный контур
 
@@ -23,7 +23,7 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - React UI поиска, кликабельных источников, feedback и административной аналитики;
 - пагинируемый журнал запросов и viewer фактических LangGraph-траекторий;
 - воспроизводимый smoke-test upload → ask → deactivate → ask → restore → ask.
-- опциональный публичный demo ingress: production React через Caddy Basic Auth и ngrok;
+- опциональный публичный demo ingress: production React через Caddy Basic Auth и Tailscale Funnel;
 - неблокирующие конфигурируемые лимиты параллельных ask/ingest в публичном режиме.
 
 Bounded LangGraph agent и CrossEncoder reranker реализованы за независимыми флагами
@@ -96,21 +96,24 @@ npm run dev
 
 ## Публичный стенд для жюри
 
-CLIP-008 не создаёт вторую конфигурацию или корпус. Существующий backend остаётся на
+CLIP-010 не создаёт вторую конфигурацию или корпус. Существующий backend остаётся на
 loopback; Caddy раздаёт `frontend/dist`, защищает все UI/API/health маршруты одним
-bcrypt Basic Auth и слушает отдельный loopback-порт; ngrok публикует только Caddy.
+bcrypt Basic Auth и слушает отдельный loopback-порт; Tailscale Funnel публикует только
+Caddy. Tailscale Serve не является публичной заменой Funnel.
 
 ```powershell
-# После заполнения demo-параметров в существующем .env и создания backup:
-.\scripts\demo\Start-PublicDemo.ps1 -RebuildFrontend
+# После заполнения demo-параметров в существующем .env и verified backup:
+.\scripts\demo\Start-PublicDemo.ps1 -RebuildFrontend -StartFunnel
+.\scripts\demo\Get-PublicDemoStatus.ps1
 $credential = Get-Credential -UserName jury
-.\scripts\demo\Test-PublicDemo.ps1 -Credential $credential
-# Остановить проверенный локальный экземпляр по PID, напечатанным launcher-ом.
-.\scripts\demo\Start-PublicDemo.ps1 -StartTunnel
+.\scripts\demo\Test-PublicDemo.ps1 -BaseUri https://<actual-node>.ts.net -Credential $credential
+# Только для компонентов, запущенных новым launcher-ом:
+.\scripts\demo\Stop-PublicDemo.ps1
 ```
 
-Полная настройка, backup, смена пароля, внешняя проверка и остановка:
-[docs/CLIP008_PUBLIC_DEMO.md](docs/CLIP008_PUBLIC_DEMO.md).
+Полная настройка, безопасный переход с ручного Funnel, повторный запуск после reboot,
+диагностика и остановка: [docs/CLIP010_TAILSCALE_DEMO.md](docs/CLIP010_TAILSCALE_DEMO.md).
+Ngrok-вариант сохранён только как исторический контекст CLIP-008.
 
 Verified backup основных PostgreSQL/Qdrant/OpenSearch/storage ресурсов выполняется
 fail-closed процедурой CLIP-009. Сначала обязателен read-only preflight; без настроенного
