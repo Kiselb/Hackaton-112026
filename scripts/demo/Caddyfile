@@ -32,7 +32,7 @@ http://:{$DEMO_PROXY_PORT} {
 			max_size {$DEMO_MAX_REQUEST_BODY}
 		}
 
-		@backend path /api/* /healthz /readyz
+		@backend path /api/* /healthz /readyz /docs /docs/* /redoc /openapi.json
 		handle @backend {
 			reverse_proxy 127.0.0.1:{$DEMO_BACKEND_PORT} {
 				header_up -Authorization

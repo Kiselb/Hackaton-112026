@@ -113,6 +113,9 @@ $credential = Get-Credential -UserName jury
 
 Полная настройка, безопасный переход с ручного Funnel, повторный запуск после reboot,
 диагностика и остановка: [docs/CLIP010_TAILSCALE_DEMO.md](docs/CLIP010_TAILSCALE_DEMO.md).
+Настройка защищённых Swagger UI, ReDoc и OpenAPI JSON, включая ограничения
+`Try it out` и процедуру Caddy reload/rollback:
+[docs/CLIP011_API_DOCUMENTATION.md](docs/CLIP011_API_DOCUMENTATION.md).
 Ngrok-вариант сохранён только как исторический контекст CLIP-008.
 
 Verified backup основных PostgreSQL/Qdrant/OpenSearch/storage ресурсов выполняется
@@ -204,7 +207,8 @@ Smoke следует запускать на свежих проектных р�
 а обычный сформированный ответ получает quality status `unknown`. Схема классификации и
 API описаны в [docs/reports/CLIP007_ANALYTICS.md](docs/reports/CLIP007_ANALYTICS.md).
 
-OpenAPI: `http://127.0.0.1:8000/docs`.
+OpenAPI локально: `http://127.0.0.1:8000/docs`. На публичном стенде использовать
+только защищённый Caddy route `https://kronwerk.tail9a1e57.ts.net/docs`.
 
 ## Текущее состояние CLIP-002
 

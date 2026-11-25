@@ -114,6 +114,14 @@ Funnel mapping на `http://127.0.0.1:<DEMO_PROXY_PORT>` и публичный `
 показывает пароль, токены или DSN. Readiness приложения проверяет предусмотренную
 приложением доступность PostgreSQL, Qdrant, OpenSearch и Ollama.
 
+Конфигурация CLIP-011 добавляет за тот же site-wide Basic Auth маршруты `/docs`,
+`/redoc` и `/openapi.json`; до отдельного согласованного Caddy reload работающий
+стенд не изменяется. Маршруты проксируются в существующий loopback FastAPI;
+Swagger использует относительный `/openapi.json` и вызывает `/api/*` на текущем
+HTTPS origin. Адреса, риски Try it out, внешние assets и процедура применения
+и отката описаны в
+[CLIP011_API_DOCUMENTATION.md](CLIP011_API_DOCUMENTATION.md).
+
 ## Безопасная остановка
 
 ```powershell
