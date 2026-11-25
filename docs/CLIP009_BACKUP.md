@@ -61,9 +61,22 @@ OpenSearch repository и его фактический bind mount, listeners и 
 D:\EDUCATION\AIU Стажировка Водоканал\rvk-office-ai\RAG\docker-compose.yml
 ```
 
-Сейчас сервис имеет только именованный data volume `opensearch_data` на
+Диагностика CLIP-009-INFRA подтвердила фактический Docker volume
+`rag_opensearch_data` (Compose logical name `opensearch_data`) на
 `/usr/share/opensearch/data`. Он также обслуживает прежний проект, поэтому менять или
-перезапускать его без отдельного разрешения нельзя.
+перезапускать его без отдельного разрешения нельзя. До изменений cluster был `green`,
+все 14 индексов были `open/green`, активных snapshot/recovery не было.
+
+Выбранный Windows path получен через `GetFolderPath('MyDocuments')`:
+
+```text
+C:\Users\mvkiselev\Documents\AI-Agent-Clip-Backups\opensearch-repository
+```
+
+Он находится вне Git и Docker volumes; на диске было свободно около 1.37 TiB. На момент
+диагностики каталог ещё не создан, поэтому фактическая Docker write-проверка и ACL
+самого каталога не выполнены. Sandbox разрешает только read-only доступ к внешнему
+Compose/Documents: изменения должен применить владелец вручную.
 
 Безопасный план, который **ещё не выполнен**:
 
@@ -81,8 +94,7 @@ D:\EDUCATION\AIU Стажировка Водоканал\rvk-office-ai\RAG\docke
    `POST /_snapshot/clip_backup/_verify` и повторить preflight.
 
 Планируемая минимальная дельта только внутри существующего `opensearch` service
-(placeholder должен быть заменён выбранным абсолютным Windows path; дельту пока не
-применять):
+(дельта пока не применена):
 
 ```yaml
 environment:
@@ -90,9 +102,73 @@ environment:
 volumes:
   - opensearch_data:/usr/share/opensearch/data
   - type: bind
-    source: <Documents/AI-Agent-Clip-Backups/opensearch-repository>
+    source: C:/Users/mvkiselev/Documents/AI-Agent-Clip-Backups/opensearch-repository
     target: /mnt/clip-backups
 ```
+
+И текущий, и in-memory candidate прошли Docker Compose 2.40.2
+`config --quiet` с exit code 0. Прямая настройка `path.repo` через environment с точкой
+поддерживается Docker image OpenSearch: такие settings преобразуются image entrypoint в
+`-E` startup flags. Официальные ссылки:
+[configuration](https://docs.opensearch.org/latest/opensearch/configuration/) и
+[snapshot/restore](https://docs.opensearch.org/latest/tuning-your-cluster/availability-and-recovery/snapshots/snapshot-restore/).
+
+Отдельный риск recreate: работающий контейнер имеет `Config.Image=...:latest`, image ID
+`sha256:bcc179...`, но API сообщает версию 3.8.0. Compose уже содержит точный tag
+`...:3.8.0`, которого локально нет. До recreate следует после подтверждения владельца
+присвоить **тому же image ID** локальный tag `3.8.0` и запускать с `--pull never`; это
+исключает молчаливую смену bits/версии.
+
+### Результат разрешённого recreate
+
+После явного подтверждения владельца 2026-11-24 текущему image ID был назначен локальный
+tag `3.8.0`, затем выполнен только `opensearch` с
+`--no-deps --force-recreate --pull never`. Новый container ID: `68a440de48fd...`; image
+ID и volume `rag_opensearch_data` сохранились. PostgreSQL/Qdrant container IDs не
+изменились. OpenSearch 3.8.0 вернулся в `green`, `path.repo=/mnt/clip-backups`, bind
+mount виден и доступен для записи.
+
+Дальнейшая процедура остановлена до решения владельца: у всех 14 видимых индексов
+сохранились имена, UUID и live `docs.count`, но у
+`top_queries-2026.11.23-89315` физический Lucene `docs.deleted` изменился с 6 на 4, а у
+`top_queries-2026.11.17-89288` `store.size` изменился с 82.6 kB на 23 kB. `_count`
+первого индекса остаётся 322; segment stats показывают 322 live docs и два tombstones в
+непоисковом сегменте, active merge/task/recovery отсутствуют. Это соответствует очистке
+физических segment files при shard recovery, но согласно stop-rule не считается
+автоматически принятым расхождением. `clip_backup` ещё не зарегистрирован, `_verify` и
+CLIP-009 `-Preflight` после recreate не запускались.
+
+Владелец отдельно принял эти физические изменения Lucene. После этого `clip_backup`
+зарегистрирован как `fs` с `location=/mnt/clip-backups`: PUT вернул
+`acknowledged=true`, GET подтвердил точную конфигурацию, `_verify` подтвердил node
+`68a440de48fd`.
+
+Windows PowerShell 5.1 `-Preflight` затем остановился до backup на трёх подтверждённых
+дефектах portability скрипта:
+
+1. параметр `[string]$Repository` и локальная переменная `$repository` считаются одним
+   регистронезависимым именем; repository object приводится к строке, после чего
+   `$repository.type` падает на строке 198;
+2. Docker Desktop сообщает bind source как
+   `/run/desktop/mnt/host/c/Users/...`; `GetFullPath` в Windows превращает его в
+   несуществующий `D:\run\desktop\...`, хотя фактический каталог на `C:` существует;
+3. `@($mountJson | ConvertFrom-Json)` в Windows PowerShell 5.1 сохраняет JSON array как
+   один вложенный `System.Object[]`, поэтому named volume и repository bind не
+   обрабатываются как отдельные mounts.
+
+Исправление использует отдельное имя `$repositoryConfig`, детерминированно преобразует
+Docker Desktop source вида `/run/desktop/mnt/host/<drive>/...` обратно в Windows path и
+явно разворачивает каждый mount. Repository принимается только при единственном точном
+совпадении `Destination`, `Type=bind` и существующем host-каталоге; неизвестные форматы
+по-прежнему завершаются fail closed. Pytest дополнительно запрещает `--basetemp` внутри
+рабочего `STORAGE_ROOT`.
+
+После удаления трёх подтверждённых sandbox test artifacts и read-only инвентаризации
+`STORAGE_ROOT` финальный `-Preflight` 2026-11-25 завершился с exit code 0. Проверены
+PostgreSQL 17.11, Qdrant 1.15.5, OpenSearch 3.8.0, 17 storage files/37,315 bytes,
+отсутствие listeners FastAPI/Caddy и repository `clip_backup` по Windows host path.
+Фактический backup не запускался, каталогов `clip009-*` нет; `-Backup` по-прежнему
+требует отдельного разрешения.
 
 После согласованного recreate и проверки cluster/index repository регистрируется один
 раз:

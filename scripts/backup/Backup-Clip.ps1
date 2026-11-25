@@ -183,6 +183,86 @@ function Get-DockerToolVersion {
     return ($lines -join " ").Trim()
 }
 
+function ConvertFrom-DockerBindSource {
+    param([string]$Source)
+
+    if ([string]::IsNullOrWhiteSpace($Source)) {
+        throw "Docker bind source path is empty."
+    }
+    if ($Source -match '^[A-Za-z]:[\\/]') {
+        return [IO.Path]::GetFullPath($Source)
+    }
+    if ($Source -match '^/run/desktop/mnt/host/([A-Za-z])(?:/(.*))?$') {
+        $drive = $Matches[1].ToUpperInvariant()
+        $tail = [string]$Matches[2]
+        if ([string]::IsNullOrWhiteSpace($tail)) { return "$drive`:" + '\' }
+        if ($tail -match '(^|/)\.\.?(/|$)') {
+            throw "Docker Desktop bind source contains a relative path segment."
+        }
+        return [IO.Path]::GetFullPath(("{0}:\{1}" -f $drive, ($tail -replace '/', '\')))
+    }
+    throw "Unsupported Docker bind source path format: $Source"
+}
+
+function ConvertFrom-DockerMountJson {
+    param([string]$Json)
+
+    if ([string]::IsNullOrWhiteSpace($Json)) {
+        throw "Docker mount JSON is empty."
+    }
+    try {
+        $parsedMounts = ConvertFrom-Json -InputObject $Json -ErrorAction Stop
+    } catch {
+        throw "Docker mount JSON is invalid."
+    }
+
+    $mounts = @()
+    foreach ($mount in $parsedMounts) {
+        if ($null -eq $mount) {
+            throw "Docker mount JSON contains an empty mount."
+        }
+        foreach ($requiredProperty in @("Type", "Source", "Destination")) {
+            if ($null -eq $mount.PSObject.Properties[$requiredProperty]) {
+                throw "Docker mount JSON is missing '$requiredProperty'."
+            }
+        }
+        $mounts += $mount
+    }
+    if ($mounts.Count -eq 0) {
+        throw "Docker mount JSON contains no mounts."
+    }
+    return $mounts
+}
+
+function Get-DockerBindMountForDestination {
+    param([object[]]$Mounts, [string]$Destination)
+
+    $expectedDestination = $Destination.TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($expectedDestination)) {
+        throw "Expected Docker mount destination is empty."
+    }
+
+    $matchingMounts = @()
+    foreach ($mount in $Mounts) {
+        $mountDestination = ([string]$mount.Destination).TrimEnd('/')
+        if ($mountDestination -ceq $expectedDestination) {
+            $matchingMounts += $mount
+        }
+    }
+    if ($matchingMounts.Count -eq 0) {
+        throw "Repository location '$Destination' is not backed by a visible Docker mount."
+    }
+    if ($matchingMounts.Count -ne 1) {
+        throw "Repository location '$Destination' has multiple Docker mounts."
+    }
+
+    $matchingMount = $matchingMounts[0]
+    if ([string]$matchingMount.Type -cne "bind") {
+        throw "Repository must use a host bind mount, not Docker mount type '$($matchingMount.Type)'."
+    }
+    return $matchingMount
+}
+
 function Get-OpenSearchRepositoryInfo {
     param([string]$BaseUrl, [string]$Repository, [string]$Container)
 
@@ -194,44 +274,26 @@ function Get-OpenSearchRepositoryInfo {
     }
     $property = $repositoryResult.PSObject.Properties[$Repository]
     if ($null -eq $property) { throw "OpenSearch did not return repository '$Repository'." }
-    $repository = $property.Value
-    if ($repository.type -ne "fs") {
-        throw "Verified automation currently requires an fs OpenSearch repository; found '$($repository.type)'."
+    $repositoryConfig = $property.Value
+    if ($repositoryConfig.type -ne "fs") {
+        throw "Verified automation currently requires an fs OpenSearch repository; found '$($repositoryConfig.type)'."
     }
-    $location = [string]$repository.settings.location
+    $location = [string]$repositoryConfig.settings.location
     if ([string]::IsNullOrWhiteSpace($location) -or -not $location.StartsWith('/')) {
         throw "OpenSearch fs repository has no absolute location."
     }
 
     $mountJson = (Invoke-DockerText @("inspect", "--format", "{{json .Mounts}}", $Container)) -join ""
-    $mounts = @($mountJson | ConvertFrom-Json)
-    $matchingMount = $null
-    foreach ($mount in $mounts) {
-        $destination = ([string]$mount.Destination).TrimEnd('/')
-        if ($location -eq $destination -or $location.StartsWith($destination + "/")) {
-            if ($null -eq $matchingMount -or $destination.Length -gt ([string]$matchingMount.Destination).Length) {
-                $matchingMount = $mount
-            }
-        }
-    }
-    if ($null -eq $matchingMount) {
-        throw "Repository location '$location' is not backed by a visible Docker mount."
-    }
-    if ($matchingMount.Type -ne "bind") {
-        throw "Repository must use a host bind mount, not Docker mount type '$($matchingMount.Type)'."
-    }
-    $relativeLocation = $location.Substring(([string]$matchingMount.Destination).TrimEnd('/').Length).TrimStart('/')
-    $hostPath = [string]$matchingMount.Source
-    if (-not [string]::IsNullOrWhiteSpace($relativeLocation)) {
-        $hostPath = Join-Path $hostPath ($relativeLocation -replace '/', '\')
-    }
-    $hostPath = ConvertTo-CanonicalPath $hostPath $RepoRoot
+    $mounts = @(ConvertFrom-DockerMountJson $mountJson)
+    $matchingMount = Get-DockerBindMountForDestination -Mounts $mounts -Destination $location
+    $hostPath = ConvertFrom-DockerBindSource ([string]$matchingMount.Source)
+    $hostPath = [IO.Path]::GetFullPath($hostPath).TrimEnd('\', '/')
     if (-not (Test-Path -LiteralPath $hostPath -PathType Container)) {
         throw "OpenSearch repository host path is not accessible: $hostPath"
     }
     return [ordered]@{
         name = $Repository
-        type = [string]$repository.type
+        type = [string]$repositoryConfig.type
         container_location = $location
         host_path = $hostPath
     }
