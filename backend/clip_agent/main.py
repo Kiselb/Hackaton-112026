@@ -1,11 +1,21 @@
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
@@ -26,9 +36,29 @@ from .answering import (
 )
 from .chunking import chunk_text
 from .config import get_settings
-from .db import Chunk, Document, SearchTrace, SessionLocal, TraceFeedback, init_db
+from .conversations import (
+    CONVERSATION_TOKEN_HEADER,
+    ConversationAccessError,
+    add_turn,
+    append_clarification,
+    create_conversation,
+    lock_conversation,
+    resolved_query,
+    serialize_conversation,
+)
+from .db import (
+    Chunk,
+    Conversation,
+    ConversationTurn,
+    Document,
+    SearchTrace,
+    SessionLocal,
+    TraceFeedback,
+    init_db,
+    utcnow,
+)
 from .extract import extract_text
-from .guardrails import assess_input
+from .guardrails import assess_clarification_answer, assess_input
 from .load_control import RequestGate, slot_dependency
 from .llm import (
     LlmProviderError,
@@ -59,7 +89,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Total-Count"],
+    expose_headers=["X-Total-Count", CONVERSATION_TOKEN_HEADER],
 )
 
 
@@ -89,6 +119,7 @@ class AskRequest(BaseModel):
     mode: Literal["baseline", "agent"] | None = None
     llm_provider: Literal["ollama", "openai"] | None = None
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
+    conversation_id: UUID | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -262,6 +293,10 @@ def ask(
     payload: AskRequest,
     db: Session = Depends(get_db),
     _slot: None = Depends(acquire_llm_slot),
+    response: Response = None,
+    conversation_token: Annotated[
+        str | None, Header(alias=CONVERSATION_TOKEN_HEADER)
+    ] = None,
 ) -> dict:
     if payload.mode is not None and not settings.agent_demo_override_enabled:
         raise HTTPException(403, "Request-level demo mode is disabled")
@@ -275,15 +310,58 @@ def ask(
     use_agent = settings.agent_enabled
     if payload.mode is not None:
         use_agent = payload.mode == "agent"
+    if payload.conversation_id is not None and not use_agent:
+        raise HTTPException(
+            409,
+            "Диалог с ожидаемым уточнением можно продолжить только в режиме AI-Агента.",
+        )
+
     started = time.perf_counter()
+    conversation: Conversation | None = None
+    issued_token: str | None = None
+    user_turn: ConversationTurn | None = None
+    effective_question = payload.question
+    follow_up = payload.conversation_id is not None
+    clarification_assessment = None
+
+    if follow_up:
+        if not isinstance(db, Session):
+            raise HTTPException(409, "Conversation persistence requires a database session")
+        try:
+            conversation = lock_conversation(
+                db,
+                payload.conversation_id,
+                conversation_token,
+                expected_status="awaiting_clarification",
+            )
+        except ConversationAccessError as exc:
+            raise HTTPException(exc.status_code, detail=str(exc)) from exc
+        if len(payload.question) > settings.conversation_max_message_chars:
+            raise HTTPException(422, "Ответ на уточнение превышает допустимую длину.")
+        clarification_assessment = assess_clarification_answer(
+            payload.question,
+            original_question=conversation.original_question,
+            clarification_question=conversation.pending_clarification or "",
+        )
+        if clarification_assessment.likely_new_question:
+            raise HTTPException(
+                409,
+                "Похоже, это новый вопрос. Используйте кнопку «Новый диалог».",
+            )
+
     trace = SearchTrace(
         question=payload.question, user_id=payload.user_id, session_id=payload.session_id
     )
     db.add(trace)
-    db.commit()
+    if isinstance(db, Session):
+        db.flush()
+    else:
+        db.commit()
     mode = "langgraph_agent" if use_agent else "baseline"
-    input_assessment = assess_input(payload.question)
-    if not input_assessment.allowed:
+    input_assessment = (
+        None if follow_up else assess_input(payload.question)
+    )
+    if input_assessment is not None and not input_assessment.allowed:
         return _finish_controlled(
             db,
             trace,
@@ -297,17 +375,148 @@ def ask(
             llm=llm,
         )
 
+    if use_agent and isinstance(db, Session):
+        if conversation is None:
+            if len(payload.question) > settings.conversation_max_message_chars:
+                raise HTTPException(422, "Сообщение превышает допустимую длину.")
+            conversation, issued_token = create_conversation(
+                db,
+                original_question=payload.question,
+                owner_id=payload.session_id,
+                settings=settings,
+            )
+            user_turn = add_turn(
+                db,
+                conversation,
+                role="user",
+                kind="original_question",
+                content=payload.question,
+                trace_id=trace.id,
+                llm_provider=selection.provider,
+                llm_model=selection.model,
+            )
+        else:
+            user_turn = add_turn(
+                db,
+                conversation,
+                role="user",
+                kind=(
+                    "clarification_answer"
+                    if clarification_assessment and clarification_assessment.allowed
+                    else "rejected_clarification"
+                ),
+                content=payload.question,
+                trace_id=trace.id,
+                llm_provider=selection.provider,
+                llm_model=selection.model,
+            )
+            if clarification_assessment and clarification_assessment.allowed:
+                conversation.user_answer_count += 1
+                append_clarification(
+                    conversation,
+                    payload.question,
+                    max_context_chars=settings.conversation_max_context_chars,
+                )
+                effective_question = resolved_query(conversation)
+                conversation.status = "processing"
+                conversation.version += 1
+                conversation.updated_at = utcnow()
+        db.commit()
+
+    conversation_details = _conversation_trace_details(
+        conversation, user_turn, effective_question
+    )
+    if clarification_assessment and not clarification_assessment.allowed:
+        result = _finish_controlled(
+            db,
+            trace,
+            started,
+            mode=mode,
+            outcome="invalid_input",
+            reason_code=clarification_assessment.reason_code or "invalid_clarification",
+            answer=clarification_assessment.message or "Ответ на уточнение не принят.",
+            agent_enabled=True,
+            details={**conversation_details, "input_guard": "clarification_rejected"},
+            llm=llm,
+        )
+        return _finalize_conversation_result(
+            db,
+            conversation,
+            trace,
+            result,
+            selection.provider,
+            selection.model,
+            response=response,
+            issued_token=issued_token,
+            preserve_awaiting=True,
+        )
+    if clarification_assessment and clarification_assessment.user_does_not_know:
+        result = _finish_controlled(
+            db,
+            trace,
+            started,
+            mode=mode,
+            outcome="quality_review_required",
+            reason_code="clarification_unknown",
+            answer=(
+                "Без запрошенного условия нельзя однозначно выбрать применимый регламент. "
+                "Предлагаю обратиться в службу качества."
+            ),
+            agent_enabled=True,
+            details=conversation_details,
+            llm=llm,
+        )
+        return _finalize_conversation_result(
+            db,
+            conversation,
+            trace,
+            result,
+            selection.provider,
+            selection.model,
+            response=response,
+            issued_token=issued_token,
+        )
+    if (
+        conversation is not None
+        and conversation.user_answer_count > settings.conversation_max_user_answers
+    ):
+        result = _finish_controlled(
+            db,
+            trace,
+            started,
+            mode=mode,
+            outcome="quality_review_required",
+            reason_code="clarification_answer_limit",
+            answer=(
+                "Не удалось устранить неоднозначность в пределах допустимого числа ответов. "
+                "Предлагаю обратиться в службу качества."
+            ),
+            agent_enabled=True,
+            details=conversation_details,
+            llm=llm,
+        )
+        return _finalize_conversation_result(
+            db,
+            conversation,
+            trace,
+            result,
+            selection.provider,
+            selection.model,
+            response=response,
+            issued_token=issued_token,
+        )
+
     if use_agent:
         try:
             result = run_agent(
-                payload.question,
+                effective_question,
                 payload.user_id,
                 payload.session_id,
                 str(trace.id),
                 llm=llm,
             )
         except Exception as exc:
-            return _finish_controlled(
+            controlled = _finish_controlled(
                 db,
                 trace,
                 started,
@@ -319,8 +528,23 @@ def ask(
                     "Неподтверждённый ответ не опубликован. Пожалуйста, повторите запрос позже."
                 ),
                 agent_enabled=True,
-                details={"error": str(exc), "fallback_attempted": False},
+                details={
+                    **conversation_details,
+                    "error": str(exc),
+                    "fallback_attempted": False,
+                },
                 llm=llm,
+            )
+            return _finalize_conversation_result(
+                db,
+                conversation,
+                trace,
+                controlled,
+                selection.provider,
+                selection.model,
+                response=response,
+                issued_token=issued_token,
+                preserve_awaiting=follow_up,
             )
         latency_ms = round((time.perf_counter() - started) * 1000)
         sources = result["sources"]
@@ -344,12 +568,13 @@ def ask(
         trace.status = "failed" if outcome == "technical_error" else "ok"
         trace.details = {
             **details,
+            **conversation_details,
             **llm.summary(),
             "outcome": outcome,
             "reason_code": reason_code,
         }
         db.commit()
-        return {
+        api_result = {
             "answer": result["answer"],
             "sources": sources,
             "retrieval": _redact_internal_errors(retrieval_trace),
@@ -386,8 +611,177 @@ def ask(
                 "provider_error_category": llm.last_error_category,
             },
         }
+        return _finalize_conversation_result(
+            db,
+            conversation,
+            trace,
+            api_result,
+            selection.provider,
+            selection.model,
+            response=response,
+            issued_token=issued_token,
+            preserve_awaiting=follow_up and outcome == "technical_error",
+        )
 
     return _run_baseline(payload, db, trace, started, llm)
+
+
+def _conversation_trace_details(
+    conversation: Conversation | None,
+    turn: ConversationTurn | None,
+    resolved_question: str,
+) -> dict[str, Any]:
+    if conversation is None:
+        return {}
+    return {
+        "conversation_id": str(conversation.id),
+        "conversation_turn": turn.ordinal if turn else None,
+        "original_question": conversation.original_question,
+        "resolved_query": resolved_question,
+        "clarification_count": conversation.clarification_count,
+        "clarification_answer_count": conversation.user_answer_count,
+    }
+
+
+def _finalize_conversation_result(
+    db: Session,
+    conversation: Conversation | None,
+    trace: SearchTrace,
+    result: dict[str, Any],
+    llm_provider: str,
+    llm_model: str,
+    *,
+    response: Response | None,
+    issued_token: str | None,
+    preserve_awaiting: bool = False,
+) -> dict[str, Any]:
+    if conversation is None or not isinstance(db, Session):
+        return result
+
+    outcome = str(result.get("outcome") or "technical_error")
+    if outcome == "clarification_required" and (
+        conversation.clarification_count >= settings.conversation_max_clarifications
+        or conversation.user_answer_count >= settings.conversation_max_user_answers
+    ):
+        outcome = "quality_review_required"
+        result["outcome"] = outcome
+        result["reason_code"] = "clarification_limit_reached"
+        result["answer"] = (
+            "Не удалось устранить неоднозначность в пределах допустимого числа уточнений. "
+            "Предлагаю обратиться в службу качества."
+        )
+        if isinstance(result.get("metrics"), dict):
+            result["metrics"]["citations_valid"] = False
+
+    if preserve_awaiting:
+        conversation.status = "awaiting_clarification"
+        kind = "clarification_rejected" if outcome == "invalid_input" else "technical_error"
+    elif outcome == "clarification_required":
+        conversation.status = "awaiting_clarification"
+        conversation.pending_clarification = str(result["answer"])
+        conversation.clarification_count += 1
+        kind = "clarification_question"
+    else:
+        conversation.status = "completed"
+        conversation.pending_clarification = None
+        kind = "final_answer"
+    conversation.version += 1
+    conversation.updated_at = utcnow()
+    assistant_turn = add_turn(
+        db,
+        conversation,
+        role="assistant",
+        kind=kind,
+        content=str(result.get("answer") or ""),
+        trace_id=trace.id,
+        outcome=outcome,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+    )
+    trace_details = trace.details if isinstance(trace.details, dict) else {}
+    trace.details = {
+        **trace_details,
+        "conversation_id": str(conversation.id),
+        "conversation_turn": assistant_turn.ordinal,
+        "conversation_status": conversation.status,
+        "outcome": outcome,
+        "reason_code": result.get("reason_code"),
+    }
+    db.commit()
+    result.update(
+        {
+            "conversation_id": str(conversation.id),
+            "turn_id": str(assistant_turn.id),
+            "conversation_status": conversation.status,
+            "awaiting_clarification": conversation.status == "awaiting_clarification",
+            "expires_at": conversation.expires_at.isoformat(),
+        }
+    )
+    if issued_token and response is not None:
+        response.headers[CONVERSATION_TOKEN_HEADER] = issued_token
+    return result
+
+
+@app.get("/api/v1/conversations/{conversation_id}")
+def conversation_history(
+    conversation_id: UUID,
+    conversation_token: Annotated[
+        str | None, Header(alias=CONVERSATION_TOKEN_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        conversation = lock_conversation(db, conversation_id, conversation_token)
+    except ConversationAccessError as exc:
+        raise HTTPException(exc.status_code, detail=str(exc)) from exc
+    turns = db.scalars(
+        select(ConversationTurn)
+        .where(ConversationTurn.conversation_id == conversation.id)
+        .order_by(ConversationTurn.ordinal)
+    ).all()
+    serialized_turns = []
+    for turn in turns:
+        sources: list[dict[str, Any]] = []
+        if turn.trace_id is not None:
+            trace = db.get(SearchTrace, turn.trace_id)
+            if trace is not None:
+                sources = _trace_sources(db, trace)
+        serialized_turns.append(
+            {
+                "id": str(turn.id),
+                "ordinal": turn.ordinal,
+                "role": turn.role,
+                "kind": turn.kind,
+                "content": turn.content,
+                "trace_id": str(turn.trace_id) if turn.trace_id else None,
+                "outcome": turn.outcome,
+                "llm_provider": turn.llm_provider,
+                "llm_model": turn.llm_model,
+                "sources": sources if turn.role == "assistant" else [],
+                "created_at": turn.created_at.isoformat(),
+            }
+        )
+    return {**serialize_conversation(conversation), "turns": serialized_turns}
+
+
+@app.post("/api/v1/conversations/{conversation_id}/close")
+def close_conversation(
+    conversation_id: UUID,
+    conversation_token: Annotated[
+        str | None, Header(alias=CONVERSATION_TOKEN_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        conversation = lock_conversation(db, conversation_id, conversation_token)
+    except ConversationAccessError as exc:
+        raise HTTPException(exc.status_code, detail=str(exc)) from exc
+    conversation.status = "closed"
+    conversation.pending_clarification = None
+    conversation.version += 1
+    conversation.updated_at = utcnow()
+    db.commit()
+    return serialize_conversation(conversation)
 
 
 def _finish_controlled(

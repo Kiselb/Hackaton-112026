@@ -26,6 +26,15 @@ class InputAssessment:
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class ClarificationAssessment:
+    allowed: bool
+    reason_code: str | None = None
+    message: str | None = None
+    user_does_not_know: bool = False
+    likely_new_question: bool = False
+
+
 _ROLE_OVERRIDE = re.compile(
     r"\b(?:игнорир\w*|забуд\w*|отмен\w*|обойди\w*|не\s+следуй)\b.{0,120}"
     r"\b(?:инструкц\w*|правил\w*|ограничен\w*|провер\w*|документ\w*)\b|"
@@ -101,6 +110,58 @@ def assess_input(question: str) -> InputAssessment:
         return InputAssessment(False, "invalid_input", "unrecognized_intent", INVALID_INPUT_MESSAGE)
 
     return InputAssessment(True)
+
+
+_DOES_NOT_KNOW = re.compile(
+    r"^\s*(?:не\s+знаю|не\s+помню|не\s+могу\s+(?:сказать|уточнить|определить)|"
+    r"мне\s+неизвестно|нет\s+информации)(?:[,;:.!?\s].*)?$",
+    re.IGNORECASE,
+)
+
+
+def assess_clarification_answer(
+    answer: str,
+    *,
+    original_question: str,
+    clarification_question: str,
+) -> ClarificationAssessment:
+    """Validate a bounded clarification as context data, not as a standalone question."""
+    del original_question, clarification_question
+    normalized = " ".join(answer.split())
+    if not normalized or not re.search(r"[A-Za-zА-Яа-яЁё0-9]", normalized):
+        return ClarificationAssessment(
+            False,
+            "empty_clarification",
+            "Введите ответ на уточняющий вопрос или завершите диалог.",
+        )
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", normalized)
+    cyrillic = re.findall(r"[А-Яа-яЁё]", normalized)
+    if letters and (not cyrillic or len(cyrillic) / len(letters) < 0.25):
+        return ClarificationAssessment(
+            False,
+            "unsupported_language",
+            INVALID_INPUT_MESSAGE,
+        )
+    compact = re.sub(r"\s+", "", normalized.lower())
+    if re.fullmatch(r"(.)\1{4,}", compact) or re.search(r"[^\w\s]{5,}", normalized):
+        return ClarificationAssessment(False, "meaningless_input", INVALID_INPUT_MESSAGE)
+    if _ROLE_OVERRIDE.search(normalized) and not _DISCUSSION_PREFIX.search(normalized):
+        return ClarificationAssessment(
+            False,
+            "prompt_injection_detected",
+            INJECTION_MESSAGE,
+        )
+    user_does_not_know = bool(_DOES_NOT_KNOW.match(normalized))
+    likely_new_question = (
+        normalized.endswith("?")
+        and len(re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", normalized)) >= 3
+        and bool(_INTENT_CUE.search(normalized))
+    )
+    return ClarificationAssessment(
+        True,
+        user_does_not_know=user_does_not_know,
+        likely_new_question=likely_new_question,
+    )
 
 
 def sanitize_document_text(text: str) -> tuple[str, list[str]]:

@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     agent_max_retries: int = Field(default=1, ge=0, le=3)
     agent_max_llm_calls: int = Field(default=4, ge=1, le=10)
     agent_demo_override_enabled: bool = False
+    conversation_ttl_minutes: int = Field(default=60, ge=5, le=1440)
+    conversation_max_clarifications: int = Field(default=2, ge=1, le=5)
+    conversation_max_user_answers: int = Field(default=3, ge=1, le=10)
+    conversation_max_context_chars: int = Field(default=2000, ge=256, le=8000)
+    conversation_max_message_chars: int = Field(default=1000, ge=64, le=4000)
     public_demo_enabled: bool = False
     demo_max_concurrent_llm: int = Field(default=1, ge=1, le=16)
     demo_max_concurrent_ingest: int = Field(default=1, ge=1, le=8)

@@ -18,6 +18,7 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - опциональный локальный CrossEncoder reranking после проверки активности;
 - bounded AI-Агент по умолчанию с input guardrails, evidence assessment и fail-closed answer validation;
 - request-level выбор локального Ollama или OpenAI Responses API с единым LLM-интерфейсом;
+- stateful-уточнения с PostgreSQL-историей, повторным retrieval и изоляцией диалогов;
 - numbered sources, semantic grounding и проверка номеров цитат для обоих провайдеров;
 - traces, timings и token counts в PostgreSQL;
 - деактивация и восстановление документов;
@@ -77,6 +78,12 @@ LLM по умолчанию остаётся `ollama`/`qwen3.5:9b`. Опцион
 backend-настройками, использует Responses API с `store=false` и серверный allowlist
 моделей. Выбор provider/model действует на один запрос и не меняет глобальную
 конфигурацию: [docs/CLIP013_LLM_PROVIDERS.md](docs/CLIP013_LLM_PROVIDERS.md).
+
+Уточняющий диалог хранится в additive-таблицах `conversations` и
+`conversation_turns`. По умолчанию незавершённый контекст действует 60 минут, допускает
+не более двух уточняющих вопросов и трёх пользовательских ответов. Токен владения
+передаётся только в `X-Conversation-Token`, а в PostgreSQL хранится его SHA-256-хеш:
+[docs/CLIP014_CLARIFICATION_DIALOGUE.md](docs/CLIP014_CLARIFICATION_DIALOGUE.md).
 
 Для локальной браузерной демонстрации можно отдельно установить
 `AGENT_DEMO_OVERRIDE_ENABLED=true`. Тогда UI показывает request-level выбор режима;
@@ -202,6 +209,8 @@ Smoke следует запускать на свежих проектных р�
 - `POST /api/v1/documents/{id}/deactivate`;
 - `POST /api/v1/documents/{id}/restore`;
 - `POST /api/v1/ask`;
+- `GET /api/v1/conversations/{id}` — история только с корректным ownership token;
+- `POST /api/v1/conversations/{id}/close` — завершение без LLM-вызова;
 - `GET /api/v1/capabilities` — demo override и безопасный список LLM-провайдеров/моделей;
 - `GET /api/v1/admin/analytics` — агрегаты, mode share, latency/tokens и динамика;
 - `GET /api/v1/admin/traces` — фильтруемый список с `limit`/`offset`;
@@ -232,6 +241,8 @@ registry. Для `/api/chat` приложение отправляет конф�
 ## Ограничения
 
 - нет OCR, распознавания таблиц и сканов;
+- токен диалога изолирует демонстрационные вкладки, но не заменяет корпоративную
+  аутентификацию и ACL;
 - прямой FastAPI не имеет аутентификации; публичный demo ingress имеет общий Basic Auth,
   но не ACL или production security;
 - административные traces доступны глобально в локальном MVP; фильтры не являются ACL;

@@ -11,7 +11,8 @@
 
 ## System boundary
 
-- **Presentation:** React+TS, two views (search/admin), demo identities.
+- **Presentation:** React+TS, диалоговый поиск и admin views; уникальная identity и
+  ownership token живут в `sessionStorage` конкретной вкладки.
 - **Application/API:** FastAPI request validation, upload ingestion, query lifecycle, feedback.
 - **Agent:** LangGraph, bounded graph, evidence-based answer synthesis.
 - **Model adapters:** request-scoped Ollama/OpenAI LLM session, SentenceTransformers
@@ -56,6 +57,36 @@ question + user_id + session_id
        source IDs, gaps, per-node latency, actual tokens and bounded call counters
 ```
 
+## Stateful clarification dialogue
+
+`Conversation` хранит исходный вопрос, статус, хеш непредсказуемого ownership token,
+ограниченный список пользовательских уточнений, счётчики, version и expiry.
+`ConversationTurn` хранит упорядоченные user/assistant turns и ссылку на отдельный
+`SearchTrace`. Таблицы additive: существующие `search_traces` не переписываются.
+
+```text
+new agent question -> processing -> answered -> completed
+                               \-> clarification_required -> awaiting_clarification
+                                      -> guarded short answer -> processing
+                                      -> fresh LangGraph + fresh retrieval + strict validation
+                                      -> awaiting_clarification | completed
+awaiting_clarification -> close -> closed
+awaiting_clarification -> TTL -> expired
+```
+
+Продолжение требует `conversation_id` и заголовок `X-Conversation-Token`; в БД хранится
+только SHA-256-хеш, сравнение выполняется constant-time. `SELECT ... FOR UPDATE` и
+промежуточный статус `processing` не позволяют двум follow-up раздвоить состояние.
+Контекст формируется как bounded `resolved_query`: исходный вопрос остаётся отдельным,
+уточнения помечены как пользовательские условия, а не корпоративные факты. Каждый ход
+заново проходит SQL visibility gate, поэтому прежние source IDs и деактивированный между
+ходами документ не подтверждают итоговый ответ.
+
+Baseline RAG не продолжает ожидающий agent dialogue. Provider/model фиксируются новым
+`LlmSession` только на текущий ход; между ходами пользователь может явно изменить модель,
+не изменяя прошлые turns/traces. Максимумы по умолчанию: два вопроса, три ответа, 1000
+символов на сообщение, 2000 символов контекста и TTL 60 минут.
+
 **Evidence is always SQL-filtered** even if stale derived search indexes return older records. Numeric citation ID maps to an immutable search child, whose parent text is displayed with its exact start/end offsets. The generator sees the parent context; the UI highlights the search child.
 
 Reranking is disabled by default and runs only after the PostgreSQL visibility gate.
@@ -76,7 +107,7 @@ LLM calls by default. The only graph loop is
 LangGraph recursion limit make it finite. State is request-local and is not long-term or
 shared memory.
 
-The same request-scoped LLM session is used for planning, evidence assessment, answer
+The same turn-scoped LLM session is used for planning, evidence assessment, answer
 composition, citation repair and grounding validation. OpenAI uses the Responses API with
 `store=false`, no hosted tools and strict server-side model allowlisting. Missing credentials,
 provider failure, refusal, incomplete or empty output fail closed and never switch provider.

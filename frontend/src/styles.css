@@ -63,6 +63,18 @@ select, input { border: 1px solid #bcc9c2; border-radius: 8px; padding: .62rem .
 .feedback-actions { display: flex; flex-wrap: wrap; gap: .45rem; }
 .feedback button.selected { border-radius: 8px; padding: .55rem .75rem; background: #1c5c47; color: #fff; }
 .inline-error { color: #943434; font-size: .82rem; }
+.dialog-actions { display: flex; flex-wrap: wrap; gap: .55rem; align-items: center; }
+.dialog-actions .wide { flex: 1 1 220px; }
+.secondary.danger { border-color: #ddb7b7; color: #842f2f; }
+.dialogue { display: grid; gap: .85rem; }
+.chat-message { max-width: min(880px, 92%); border: 1px solid #dce5df; border-radius: 14px; padding: 1rem; box-shadow: 0 8px 24px #173b2d0d; }
+.chat-message p { margin-bottom: 0; }
+.user-message { justify-self: end; border-color: #b9d8cb; background: #edf8f2; }
+.assistant-message { justify-self: start; background: #fff; }
+.clarification-message { border-color: #e1c96d; background: #fffaf0; }
+.assistant-message h3 { margin: .15rem 0 0; }
+.message-sources { border-top: 1px solid #e3e8e5; margin-top: 1rem; padding-top: .8rem; }
+.message-sources > .sources { margin-top: .8rem; }
 
 .section-title { margin-top: .35rem; }
 .section-title > span { display: grid; min-width: 2.2rem; height: 2.2rem; place-items: center; border-radius: 50%; background: #dfe9e3; color: #2b5d4b; font-weight: 800; }

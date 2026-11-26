@@ -1,7 +1,17 @@
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
-const DEMO_USER = "web-demo";
-const DEMO_SESSION = "browser";
+const CONVERSATION_TOKEN_HEADER = "X-Conversation-Token";
+
+function tabIdentity(key: string, prefix: string): string {
+  const existing = sessionStorage.getItem(key);
+  if (existing) return existing;
+  const value = `${prefix}-${crypto.randomUUID()}`;
+  sessionStorage.setItem(key, value);
+  return value;
+}
+
+const DEMO_USER = tabIdentity("clip-demo-user", "web-demo");
+const DEMO_SESSION = tabIdentity("clip-demo-session", "browser");
 
 type Mode = "baseline" | "agent";
 type LlmProvider = "ollama" | "openai";
@@ -34,6 +44,11 @@ type Analytics = {
   total_documents: number;
   active_documents: number;
   total_queries: number;
+  total_conversations: number;
+  user_messages: number;
+  clarifications: number;
+  confirmed_answers: number;
+  quality_review_transitions: number;
   technical_errors: number;
   justified_abstentions: number;
   manual_review_required: number;
@@ -111,6 +126,35 @@ type AskResult = {
   llm_provider: LlmProvider;
   llm_model: string;
   metrics: AskMetrics;
+  conversation_id?: string;
+  turn_id?: string;
+  conversation_status?: ConversationStatus;
+  awaiting_clarification?: boolean;
+  expires_at?: string;
+};
+
+type ConversationStatus = "processing" | "awaiting_clarification" | "completed" |
+  "closed" | "expired";
+
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  kind: string;
+  content: string;
+  trace_id?: string | null;
+  outcome?: Outcome | null;
+  sources: Source[];
+  llm_provider?: LlmProvider | null;
+  llm_model?: string | null;
+  metrics?: AskMetrics;
+};
+
+type ConversationHistory = {
+  conversation_id: string;
+  status: ConversationStatus;
+  pending_clarification: string | null;
+  expires_at: string;
+  turns: Array<ChatMessage & {ordinal: number}>;
 };
 
 type LlmProviderCapability = {
@@ -189,7 +233,11 @@ function ModeBadge({mode}: {mode: Mode}) {
   </span>;
 }
 
-function AnswerText({text, sourceCount}: {text: string; sourceCount: number}) {
+function AnswerText({text, sourceCount, anchorPrefix = "source"}: {
+  text: string;
+  sourceCount: number;
+  anchorPrefix?: string;
+}) {
   const parts = text.split(/(\[\d+\]|\*\*[^*]+\*\*)/g);
   return <p className="answer-copy">{parts.map((part, index) => {
     if (part.startsWith("**") && part.endsWith("**")) {
@@ -201,14 +249,18 @@ function AnswerText({text, sourceCount}: {text: string; sourceCount: number}) {
     if (sourceNumber < 1 || sourceNumber > sourceCount) {
       return <span className="invalid-citation" key={`${part}-${index}`}>{part}</span>;
     }
-    return <a className="citation" href={`#source-${sourceNumber}`} key={`${part}-${index}`}>{part}</a>;
+    return <a className="citation" href={`#${anchorPrefix}-${sourceNumber}`} key={`${part}-${index}`}>{part}</a>;
   })}</p>;
 }
 
-function SourceCard({source, index}: {source: Source; index: number}) {
+function SourceCard({source, index, anchorPrefix = "source"}: {
+  source: Source;
+  index: number;
+  anchorPrefix?: string;
+}) {
   const start = Math.max(0, Math.min(source.child_start, source.parent_text.length));
   const end = Math.max(start, Math.min(source.child_end, source.parent_text.length));
-  return <article className="source-card" id={`source-${index + 1}`}>
+  return <article className="source-card" id={`${anchorPrefix}-${index + 1}`}>
     <div className="source-heading">
       <div><span className="source-number">[{index + 1}]</span><h3>{source.title}</h3></div>
       {source.page != null && <span className="page">стр. {source.page}</span>}
@@ -283,9 +335,17 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
     (provider) => provider.id === capabilities.llm.default_provider,
   ) ?? capabilities.llm.providers[0];
   const [llmModel, setLlmModel] = useState(initialProvider.default_model);
-  const [result, setResult] = useState<AskResult | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [conversationId, setConversationId] = useState(
+    () => sessionStorage.getItem("clip-conversation-id"),
+  );
+  const [conversationToken, setConversationToken] = useState(
+    () => sessionStorage.getItem("clip-conversation-token"),
+  );
+  const [conversationStatus, setConversationStatus] = useState<ConversationStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const lastSubmission = useRef("");
 
   useEffect(() => setRequestedMode(capabilities.default_mode), [capabilities.default_mode]);
   useEffect(() => {
@@ -295,6 +355,34 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
     );
     if (selected) setLlmModel(selected.default_model);
   }, [capabilities]);
+
+  useEffect(() => {
+    if (!conversationId || !conversationToken) return;
+    setBusy(true);
+    fetch(`/api/v1/conversations/${conversationId}`, {
+      headers: {[CONVERSATION_TOKEN_HEADER]: conversationToken},
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(await responseError(response));
+      const history = await response.json() as ConversationHistory;
+      setMessages(history.turns.map((turn) => ({
+        ...turn,
+        id: turn.id,
+        sources: turn.sources ?? [],
+      })));
+      setConversationStatus(history.status);
+      if (history.status === "awaiting_clarification") {
+        setQuestion("");
+        setRequestedMode("agent");
+      }
+    }).catch((reason) => {
+      sessionStorage.removeItem("clip-conversation-id");
+      sessionStorage.removeItem("clip-conversation-token");
+      setConversationId(null);
+      setConversationToken(null);
+      setConversationStatus(null);
+      setError(reason instanceof Error ? reason.message : "Диалог не восстановлен");
+    }).finally(() => setBusy(false));
+  }, []);
 
   const selectedProvider = capabilities.llm.providers.find(
     (provider) => provider.id === llmProvider,
@@ -308,36 +396,108 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
 
   async function submitQuestion(event: FormEvent) {
     event.preventDefault();
+    const content = question.trim();
+    if (!content) return;
+    const submissionKey = `${conversationId ?? "new"}:${content}`;
+    if (busy || submissionKey === lastSubmission.current) return;
+    lastSubmission.current = submissionKey;
     setBusy(true);
     setError("");
-    setResult(null);
     try {
       const response = await fetch("/api/v1/ask", {
         method: "POST",
-        headers: {"Content-Type": "application/json"},
+        headers: {
+          "Content-Type": "application/json",
+          ...(conversationToken ? {[CONVERSATION_TOKEN_HEADER]: conversationToken} : {}),
+        },
         body: JSON.stringify({
-          question,
+          question: content,
           user_id: DEMO_USER,
           session_id: DEMO_SESSION,
           llm_provider: llmProvider,
           llm_model: llmModel,
+          ...(conversationId ? {conversation_id: conversationId} : {}),
           ...(capabilities.agent_demo_override_enabled ? {mode: requestedMode} : {}),
         }),
       });
       if (!response.ok) throw new Error(await responseError(response));
-      setResult(await response.json());
+      const result = await response.json() as AskResult;
+      const token = response.headers.get(CONVERSATION_TOKEN_HEADER) ?? conversationToken;
+      if (result.conversation_id && token) {
+        sessionStorage.setItem("clip-conversation-id", result.conversation_id);
+        sessionStorage.setItem("clip-conversation-token", token);
+        setConversationId(result.conversation_id);
+        setConversationToken(token);
+      }
+      if (result.conversation_status) setConversationStatus(result.conversation_status);
+      if (result.awaiting_clarification) setRequestedMode("agent");
+      setMessages((current) => [
+        ...current,
+        {id: crypto.randomUUID(), role: "user", kind: conversationId ? "clarification_answer" : "original_question", content, sources: []},
+        {
+          id: result.turn_id ?? crypto.randomUUID(),
+          role: "assistant",
+          kind: result.outcome === "clarification_required" ? "clarification_question" : "final_answer",
+          content: result.answer,
+          trace_id: result.trace_id,
+          outcome: result.outcome,
+          sources: result.sources,
+          llm_provider: result.llm_provider,
+          llm_model: result.llm_model,
+          metrics: result.metrics,
+        },
+      ]);
+      setQuestion("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Поиск не выполнен");
+      lastSubmission.current = "";
     } finally {
       setBusy(false);
     }
   }
 
-  const actualMode: Mode = result?.metrics.agent_enabled ? "agent" : "baseline";
+  async function closeCurrentDialogue() {
+    if (!conversationId || !conversationToken) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`/api/v1/conversations/${conversationId}/close`, {
+        method: "POST",
+        headers: {[CONVERSATION_TOKEN_HEADER]: conversationToken},
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      setConversationStatus("closed");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Диалог не завершён");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function newDialogue() {
+    if (conversationId && conversationToken && conversationStatus === "awaiting_clarification") {
+      await fetch(`/api/v1/conversations/${conversationId}/close`, {
+        method: "POST",
+        headers: {[CONVERSATION_TOKEN_HEADER]: conversationToken},
+      }).catch(() => undefined);
+    }
+    sessionStorage.removeItem("clip-conversation-id");
+    sessionStorage.removeItem("clip-conversation-token");
+    setConversationId(null);
+    setConversationToken(null);
+    setConversationStatus(null);
+    setMessages([]);
+    setQuestion("");
+    setError("");
+    lastSubmission.current = "";
+  }
+
+  const awaiting = conversationStatus === "awaiting_clarification";
+  const canSubmit = !busy && conversationStatus !== "closed" && conversationStatus !== "completed";
   return <section className="stack">
     <form className="panel ask" onSubmit={submitQuestion}>
       <div className="form-heading">
-        <div><span className="section-kicker">Поиск с доказательствами</span><h2>Вопрос по документам</h2></div>
+        <div><span className="section-kicker">Диалог с доказательствами</span><h2>{awaiting ? "Ответьте на уточнение" : "Вопрос по документам"}</h2></div>
         <div className="request-controls">
           <label className="mode-select">Языковая модель
             <select value={llmProvider} onChange={(event) => changeProvider(event.target.value as LlmProvider)}>
@@ -354,7 +514,7 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
             </select>
           </label>}
           {capabilities.agent_demo_override_enabled ? <label className="mode-select">Режим
-            <select value={requestedMode} onChange={(event) => setRequestedMode(event.target.value as Mode)}>
+            <select disabled={awaiting} value={requestedMode} onChange={(event) => setRequestedMode(event.target.value as Mode)}>
               <option value="baseline">Базовый RAG</option>
               <option value="agent">AI-Агент</option>
             </select>
@@ -364,34 +524,39 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
       {capabilities.agent_demo_override_enabled && <p className="notice compact">
         Локальный demo override включён конфигурацией сервера. Он действует только для этого запроса.
       </p>}
-      <label htmlFor="question">Сформулируйте вопрос</label>
-      <textarea id="question" required value={question} onChange={(event) => setQuestion(event.target.value)} />
-      <button className="primary wide" disabled={busy}>{busy ? "Формирую ответ…" : "Найти ответ"}</button>
+      <label htmlFor="question">{awaiting ? "Ваше уточнение" : "Сформулируйте вопрос"}</label>
+      <textarea id="question" maxLength={1000} required value={question} onChange={(event) => {
+        setQuestion(event.target.value);
+        lastSubmission.current = "";
+      }} />
+      <div className="dialog-actions">
+        <button className="primary wide" disabled={!canSubmit}>{busy ? "Обрабатываю…" : awaiting ? "Продолжить" : "Найти ответ"}</button>
+        {conversationId && <button className="secondary" onClick={newDialogue} type="button">Новый диалог</button>}
+        {awaiting && <button className="secondary danger" disabled={busy} onClick={closeCurrentDialogue} type="button">Завершить</button>}
+      </div>
     </form>
     {error && <div className="error">{error}</div>}
-    {result && <>
-      <article className="panel answer">
-        <div className="answer-header"><div><span className="section-kicker">Результат</span><h2>{outcomeLabels[result.outcome]}</h2></div><ModeBadge mode={actualMode} /></div>
-        <div className={`outcome outcome-${result.outcome}`}>{outcomeLabels[result.outcome]}</div>
-        <AnswerText text={result.answer} sourceCount={result.sources.length} />
-        {result.outcome === "answered" && <p className="notice compact">
-          Ответ прошёл автоматическую проверку по найденным источникам, но не является экспертным утверждением.
-        </p>}
-        {result.sources.length === 0 && result.outcome === "quality_review_required" && <p className="notice compact">
-          Поиск не нашёл достаточных доказательств в активных документах. Это не доказывает отсутствие информации во всём корпоративном каталоге.
-        </p>}
-        <div className="answer-meta">
-          <span>{formatNumber(result.metrics.latency_ms)} мс</span>
-          <span>{formatNumber(result.metrics.prompt_tokens)} input tokens</span>
-          <span>{formatNumber(result.metrics.completion_tokens)} output tokens</span>
-          <span>{result.llm_provider === "openai" ? "OpenAI" : "Ollama"} · {result.llm_model}</span>
-          <span>{result.metrics.citations_valid ? "Цитаты проверены синтаксически" : "Цитаты требуют проверки"}</span>
-        </div>
-        <FeedbackForm traceId={result.trace_id} />
-      </article>
-      <div className="section-title"><div><span className="section-kicker">Evidence</span><h2>Источники</h2></div><span>{result.sources.length}</span></div>
-      <div className="sources">{result.sources.map((source, index) => <SourceCard source={source} index={index} key={source.chunk_id} />)}</div>
-    </>}
+    {conversationStatus === "closed" && <div className="notice">Диалог завершён без дополнительных LLM-вызовов. Начните новый диалог, чтобы задать вопрос.</div>}
+    <div className="dialogue">{messages.map((message) => {
+      const prefix = `message-${message.id}`;
+      if (message.role === "user") return <article className="chat-message user-message" key={message.id}>
+        <span className="section-kicker">Вы</span><p>{message.content}</p>
+      </article>;
+      return <article className={`chat-message assistant-message ${message.kind === "clarification_question" ? "clarification-message" : ""}`} key={message.id}>
+        <div className="answer-header"><div><span className="section-kicker">AI-Агент</span><h3>{message.outcome ? outcomeLabels[message.outcome] : "Ответ"}</h3></div></div>
+        {message.outcome && <div className={`outcome outcome-${message.outcome}`}>{outcomeLabels[message.outcome]}</div>}
+        <AnswerText text={message.content} sourceCount={message.sources.length} anchorPrefix={prefix} />
+        {message.outcome === "answered" && <p className="notice compact">Ответ прошёл автоматическую проверку по найденным источникам, но не является экспертным утверждением.</p>}
+        {message.metrics && <div className="answer-meta">
+          <span>{formatNumber(message.metrics.latency_ms)} мс</span>
+          <span>{formatNumber(message.metrics.prompt_tokens)} input tokens</span>
+          <span>{formatNumber(message.metrics.completion_tokens)} output tokens</span>
+          {message.llm_provider && <span>{message.llm_provider === "openai" ? "OpenAI" : "Ollama"} · {message.llm_model}</span>}
+        </div>}
+        {message.trace_id && <FeedbackForm traceId={message.trace_id} userId={DEMO_USER} sessionId={DEMO_SESSION} />}
+        {message.sources.length > 0 && <details className="message-sources"><summary>Источники: {message.sources.length}</summary><div className="sources">{message.sources.map((source, index) => <SourceCard source={source} index={index} anchorPrefix={prefix} key={source.chunk_id} />)}</div></details>}
+      </article>;
+    })}</div>
   </section>;
 }
 
@@ -401,6 +566,11 @@ function AnalyticsView({analytics}: {analytics: Analytics | null}) {
   return <section className="stack">
     <div className="notice">Технический успех не означает правильность ответа. Содержательная корректность: <b>не измерена</b>.</div>
     <div className="metric-grid">
+      <MetricCard value={analytics.total_conversations} label="Диалогов" />
+      <MetricCard value={analytics.user_messages} label="Сообщений пользователя" />
+      <MetricCard value={analytics.clarifications} label="Уточнений" />
+      <MetricCard value={analytics.confirmed_answers} label="Подтверждённых ответов" />
+      <MetricCard value={analytics.quality_review_transitions} label="Переходов в службу качества" />
       <MetricCard value={analytics.total_queries} label="Всего запросов" />
       <MetricCard value={analytics.technical_errors} label="Технических ошибок" />
       <MetricCard value={analytics.justified_abstentions} label="Обоснованных отказов" />
@@ -430,10 +600,13 @@ function TraceViewer({trace, onFeedback}: {trace: TraceDetail; onFeedback: () =>
   const queries = Array.isArray(trace.details.search_queries) ? trace.details.search_queries as string[] : [];
   const gaps = Array.isArray(trace.details.gaps) ? trace.details.gaps : [];
   const validation = trace.details.validation as Record<string, unknown> | undefined;
+  const conversationId = typeof trace.details.conversation_id === "string" ? trace.details.conversation_id : null;
+  const conversationTurn = typeof trace.details.conversation_turn === "number" ? trace.details.conversation_turn : null;
   return <div className="trace-detail stack">
     <article className="panel">
       <div className="trace-heading"><div><span className="section-kicker">Trace {trace.id}</span><h2>{trace.question}</h2></div><ModeBadge mode={trace.mode} /></div>
       <div className="trace-meta"><span>{formatDate(trace.created_at)}</span><span>user: {trace.user_id}</span><span>session: {trace.session_id}</span><span>status: {trace.status}</span></div>
+      {conversationId && <p className="muted">Диалог: {conversationId} · ход: {conversationTurn ?? "—"}. Токен доступа и чужая история здесь не отображаются.</p>}
       {trace.outcome && <div className={`outcome outcome-${trace.outcome}`}>{outcomeLabels[trace.outcome]}</div>}
       <div className="chips">{trace.categories.map((category) => <span key={category}>{categoryLabels[category] ?? category}</span>)}</div>
       {trace.answer ? <AnswerText text={trace.answer} sourceCount={trace.sources.length} /> : <p className="muted">Ответ не сформирован.</p>}

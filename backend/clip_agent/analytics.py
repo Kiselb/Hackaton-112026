@@ -162,12 +162,23 @@ def aggregate_traces(
     token_rows = 0
     llm_calls = 0
     fallback_count = 0
+    conversation_ids: set[str] = set()
+    clarification_count = 0
+    confirmed_answers = 0
+    quality_review_transitions = 0
     by_day: defaultdict[str, dict[str, int]] = defaultdict(
         lambda: {"queries": 0, "technical_errors": 0, "manual_review_required": 0}
     )
 
     for trace in rows:
         result = classify_trace(trace, feedback_by_trace.get(str(trace.id), []))
+        details = _details(trace)
+        conversation_id = details.get("conversation_id")
+        if isinstance(conversation_id, str) and conversation_id:
+            conversation_ids.add(conversation_id)
+        clarification_count += int(result["outcome"] == "clarification_required")
+        confirmed_answers += int(result["outcome"] == "answered")
+        quality_review_transitions += int(result["outcome"] == "quality_review_required")
         for category in result["categories"]:
             category_counts[category] += 1
         modes[trace_mode(trace)] += 1
@@ -191,6 +202,11 @@ def aggregate_traces(
     p95 = _nearest_rank_p95(latencies)
     return {
         "total_queries": total,
+        "total_conversations": len(conversation_ids),
+        "user_messages": total,
+        "clarifications": clarification_count,
+        "confirmed_answers": confirmed_answers,
+        "quality_review_transitions": quality_review_transitions,
         "technical_errors": category_counts["technical_error"],
         "failed_queries": category_counts["technical_error"],
         "justified_abstentions": category_counts["justified_abstention"],
