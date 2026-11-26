@@ -4,6 +4,8 @@ const DEMO_USER = "web-demo";
 const DEMO_SESSION = "browser";
 
 type Mode = "baseline" | "agent";
+type Outcome = "answered" | "clarification_required" | "quality_review_required" |
+  "conflict_detected" | "out_of_scope" | "invalid_input" | "technical_error";
 type FeedbackRating = "helpful" | "incomplete" | "incorrect" | "missing_documents";
 
 type Source = {
@@ -61,6 +63,8 @@ type TraceSummary = {
   status: string;
   technical_status: "success" | "error";
   quality_status: string;
+  outcome: Outcome | null;
+  reason_code: string | null;
   categories: string[];
   latency_ms: number | null;
   prompt_tokens: number | null;
@@ -99,6 +103,8 @@ type AskResult = {
   answer: string;
   sources: Source[];
   trace_id: string;
+  outcome: Outcome;
+  reason_code: string | null;
   metrics: AskMetrics;
 };
 
@@ -123,6 +129,16 @@ const feedbackLabels: Record<FeedbackRating, string> = {
   missing_documents: "Не хватает документов",
 };
 
+const outcomeLabels: Record<Outcome, string> = {
+  answered: "Подтверждённый ответ",
+  clarification_required: "Нужно уточнение",
+  quality_review_required: "Недостаточно подтверждённой информации",
+  conflict_detected: "Обнаружено противоречие",
+  out_of_scope: "Запрос вне компетенции",
+  invalid_input: "Некорректный запрос",
+  technical_error: "Техническая ошибка",
+};
+
 function formatNumber(value: number | null | undefined): string {
   return value == null ? "не измерено" : new Intl.NumberFormat("ru-RU").format(value);
 }
@@ -145,7 +161,7 @@ async function responseError(response: Response): Promise<string> {
 
 function ModeBadge({mode}: {mode: Mode}) {
   return <span className={`mode mode-${mode}`}>
-    {mode === "agent" ? "LangGraph agent" : "Baseline RAG"}
+    {mode === "agent" ? "AI-Агент" : "Базовый RAG"}
   </span>;
 }
 
@@ -276,8 +292,8 @@ function SearchView({capabilities}: {capabilities: {default_mode: Mode; agent_de
         <div><span className="section-kicker">Поиск с доказательствами</span><h2>Вопрос по документам</h2></div>
         {capabilities.agent_demo_override_enabled ? <label className="mode-select">Режим
           <select value={requestedMode} onChange={(event) => setRequestedMode(event.target.value as Mode)}>
-            <option value="baseline">Baseline RAG</option>
-            <option value="agent">LangGraph agent</option>
+            <option value="baseline">Базовый RAG</option>
+            <option value="agent">AI-Агент</option>
           </select>
         </label> : <ModeBadge mode={capabilities.default_mode} />}
       </div>
@@ -291,9 +307,13 @@ function SearchView({capabilities}: {capabilities: {default_mode: Mode; agent_de
     {error && <div className="error">{error}</div>}
     {result && <>
       <article className="panel answer">
-        <div className="answer-header"><div><span className="section-kicker">Результат</span><h2>Ответ</h2></div><ModeBadge mode={actualMode} /></div>
+        <div className="answer-header"><div><span className="section-kicker">Результат</span><h2>{outcomeLabels[result.outcome]}</h2></div><ModeBadge mode={actualMode} /></div>
+        <div className={`outcome outcome-${result.outcome}`}>{outcomeLabels[result.outcome]}</div>
         <AnswerText text={result.answer} sourceCount={result.sources.length} />
-        {result.sources.length === 0 && <p className="notice compact">
+        {result.outcome === "answered" && <p className="notice compact">
+          Ответ прошёл автоматическую проверку по найденным источникам, но не является экспертным утверждением.
+        </p>}
+        {result.sources.length === 0 && result.outcome === "quality_review_required" && <p className="notice compact">
           Поиск не нашёл достаточных доказательств в активных документах. Это не доказывает отсутствие информации во всём корпоративном каталоге.
         </p>}
         <div className="answer-meta">
@@ -326,8 +346,8 @@ function AnalyticsView({analytics}: {analytics: Analytics | null}) {
       <MetricCard value={analytics.fallback_count} label="Fallback" />
       <MetricCard value={analytics.tokens_measurement === "measured" ? formatNumber(analytics.input_tokens) : "не измерено"} label="Input tokens" />
       <MetricCard value={analytics.tokens_measurement === "measured" ? formatNumber(analytics.output_tokens) : "не измерено"} label="Output tokens" />
-      <MetricCard value={`${Math.round(analytics.modes.baseline_share * 100)}%`} label="Baseline" note={`${analytics.modes.baseline} запросов`} />
-      <MetricCard value={`${Math.round(analytics.modes.agent_share * 100)}%`} label="Agent" note={`${analytics.modes.agent} запросов`} />
+      <MetricCard value={`${Math.round(analytics.modes.baseline_share * 100)}%`} label="Базовый RAG" note={`${analytics.modes.baseline} запросов`} />
+      <MetricCard value={`${Math.round(analytics.modes.agent_share * 100)}%`} label="AI-Агент" note={`${analytics.modes.agent} запросов`} />
     </div>
     <article className="panel chart-panel">
       <div className="section-title"><div><span className="section-kicker">Динамика</span><h2>Запросы по дням</h2></div></div>
@@ -349,6 +369,7 @@ function TraceViewer({trace, onFeedback}: {trace: TraceDetail; onFeedback: () =>
     <article className="panel">
       <div className="trace-heading"><div><span className="section-kicker">Trace {trace.id}</span><h2>{trace.question}</h2></div><ModeBadge mode={trace.mode} /></div>
       <div className="trace-meta"><span>{formatDate(trace.created_at)}</span><span>user: {trace.user_id}</span><span>session: {trace.session_id}</span><span>status: {trace.status}</span></div>
+      {trace.outcome && <div className={`outcome outcome-${trace.outcome}`}>{outcomeLabels[trace.outcome]}</div>}
       <div className="chips">{trace.categories.map((category) => <span key={category}>{categoryLabels[category] ?? category}</span>)}</div>
       {trace.answer ? <AnswerText text={trace.answer} sourceCount={trace.sources.length} /> : <p className="muted">Ответ не сформирован.</p>}
       <div className="answer-meta"><span>{formatNumber(trace.latency_ms)} мс</span><span>{formatNumber(trace.prompt_tokens)} input</span><span>{formatNumber(trace.completion_tokens)} output</span></div>
@@ -356,8 +377,8 @@ function TraceViewer({trace, onFeedback}: {trace: TraceDetail; onFeedback: () =>
       {trace.feedback.length > 0 && <p className="muted">Оценок: {trace.feedback.length}. Они не используются как подтверждение факта.</p>}
     </article>
     <article className="panel">
-      <span className="section-kicker">Execution</span><h2>{trace.mode === "agent" ? "Траектория LangGraph" : "Baseline-выполнение"}</h2>
-      {trace.mode === "baseline" ? <p className="notice compact">Это baseline-ответ. LangGraph для этого trace не запускался.</p> : trajectory.length === 0 ?
+      <span className="section-kicker">Execution</span><h2>{trace.mode === "agent" ? "Траектория AI-Агента" : "Выполнение Базового RAG"}</h2>
+      {trace.mode === "baseline" ? <p className="notice compact">Это ответ Базового RAG. AI-Агент для этого trace не запускался.</p> : trajectory.length === 0 ?
         <p className="empty">Траектория не записана.</p> : <ol className="timeline">{trajectory.map((event) => {
           const {step, node, decision, latency_ms, prompt_tokens, completion_tokens, ...details} = event;
           return <li key={`${step}-${node}`}><div className="timeline-dot">{step}</div><details open={step === 1}>
@@ -408,7 +429,7 @@ function TracesView() {
   return <section className="trace-layout">
     <aside className="trace-list panel">
       <div className="filter-grid">
-        <label>Режим<select value={mode} onChange={(event) => setMode(event.target.value)}><option value="">Все</option><option value="baseline">Baseline</option><option value="agent">Agent</option></select></label>
+        <label>Режим<select value={mode} onChange={(event) => setMode(event.target.value)}><option value="">Все</option><option value="baseline">Базовый RAG</option><option value="agent">AI-Агент</option></select></label>
         <label>Результат<select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">Все</option>{Object.entries(categoryLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
       </div>
       {error && <div className="error compact">{error}</div>}
@@ -448,7 +469,7 @@ function DocumentsView({documents, busy, reload}: {documents: DocumentItem[]; bu
 
 export default function App() {
   const [tab, setTab] = useState<"search" | "analytics" | "traces" | "documents">("search");
-  const [capabilities, setCapabilities] = useState<{default_mode: Mode; agent_demo_override_enabled: boolean}>({default_mode: "baseline", agent_demo_override_enabled: false});
+  const [capabilities, setCapabilities] = useState<{default_mode: Mode; agent_demo_override_enabled: boolean} | null>(null);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [documentsBusy, setDocumentsBusy] = useState(false);
@@ -472,8 +493,9 @@ export default function App() {
 
   useEffect(() => {
     fetch("/api/v1/capabilities").then(async (response) => {
-      if (response.ok) setCapabilities(await response.json());
-    }).catch(() => undefined);
+      if (!response.ok) throw new Error(await responseError(response));
+      setCapabilities(await response.json());
+    }).catch((reason) => setGlobalError(reason instanceof Error ? reason.message : String(reason)));
   }, []);
   useEffect(() => {
     setGlobalError("");
@@ -488,7 +510,7 @@ export default function App() {
       <nav>{(["search", "analytics", "traces", "documents"] as const).map((item) => <button className={tab === item ? "active" : ""} key={item} onClick={() => setTab(item)}>{{search: "Поиск", analytics: "Аналитика", traces: "Трассы", documents: "Документы"}[item]}</button>)}</nav>
     </header>
     {globalError && <div className="error">{globalError}</div>}
-    {tab === "search" && <SearchView capabilities={capabilities} />}
+    {tab === "search" && (capabilities ? <SearchView capabilities={capabilities} /> : <div className="panel empty">Загружаю фактическую конфигурацию backend…</div>)}
     {tab === "analytics" && <AnalyticsView analytics={analytics} />}
     {tab === "traces" && <TracesView />}
     {tab === "documents" && <DocumentsView documents={documents} busy={documentsBusy} reload={loadDocuments} />}

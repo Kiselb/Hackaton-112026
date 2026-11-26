@@ -1,9 +1,11 @@
 from clip_agent.answering import (
     build_answer_prompt,
     build_citation_repair_prompt,
+    build_grounding_validation_prompt,
     build_temporal_abstention,
     citation_ids_admissible,
     merge_ollama_usage,
+    parse_grounding_validation,
     requires_temporal_abstention,
 )
 
@@ -66,3 +68,16 @@ def test_temporal_gate_abstains_only_without_effective_period_evidence():
     assert "невозможно определить" in answer
     assert "Дата издания сама по себе не доказывает" in answer
     assert "для всех сделок [1][2]" in answer
+
+
+def test_grounding_validator_requires_boolean_schema_and_reports_scope_errors():
+    prompt = build_grounding_validation_prompt(
+        "Кому применяется правило?", "Правило применяется всем [1].", sources()
+    )
+    assert "valid citation number alone is insufficient" in prompt
+    assert "scope (department, process, stage and conditions)" in prompt
+    valid, failures = parse_grounding_validation(
+        '{"valid":false,"unsupported_claims":[],"scope_errors":["wrong department"]}'
+    )
+    assert valid is False
+    assert failures == ["wrong department"]

@@ -39,14 +39,16 @@ Important: a revised regulation is *technical lineage*; replacing a particular b
 
 ```text
 question + user_id + session_id
-    -> AGENT_ENABLED=false: existing single-query RAG
-    -> AGENT_ENABLED=true: LangGraph
+    -> deterministic input guard (language, meaningfulness, scope, injection)
+    -> AGENT_ENABLED=false: strict single-query RAG
+    -> AGENT_ENABLED=true (default for new configs): LangGraph
          route_and_plan (simple fast route or bounded JSON plan)
          -> retrieve (existing BGE-M3 + BM25 + RRF + SQL visibility + optional rerank)
          -> assess_evidence per aspect
               -> (gap and budget available) targeted_retrieve -> assess_evidence
               -> compose_answer
-         -> validate_answer (citations, unsupported-claim guards, bounded repair)
+         -> validate_answer (citations, scope/entailment guards, bounded repair, fail-closed)
+    -> outcome (answered / clarification / quality review / conflict / rejection / technical)
          -> finish
     -> PostgreSQL SearchTrace with node trajectory, decisions, queries, source IDs,
        gaps, per-node latency, tokens and bounded call counters
@@ -63,9 +65,8 @@ remain downstream and unchanged.
 
 Multi-document questions: planner decomposes into separate aspects and search forms while
 the original question remains first. Assessment records aspect-to-source coverage and gaps.
-Planner/assessor JSON errors use controlled fallback. The assessment is not an independent
-source of facts and remains imperfect; `AGENT_ENABLED=false` is the default after the
-CLIP-006 experiment.
+Planner errors preserve the original question; assessor/validator JSON errors fail closed.
+The assessment is not an independent source of facts and remains imperfect.
 
 Agent limits are enforced before calls: at most three search calls, one retry and four
 LLM calls by default. The only graph loop is
@@ -97,8 +98,8 @@ is retained in PostgreSQL but redacted from the frontend projection.
 `AGENT_DEMO_OVERRIDE_ENABLED=false` is the safe default. When explicitly enabled on a
 loopback-only local demo or behind the authenticated CLIP-008 ingress, `/api/v1/ask`
 accepts a request-level baseline/agent choice; it does not mutate global settings. The
-response and trace always expose the actual mode, so an agent exception followed by
-baseline fallback is displayed as baseline.
+response and trace always expose the actual mode. Agent exceptions return
+`technical_error`; baseline is never started implicitly.
 
 ## Public demo ingress and overload boundary
 

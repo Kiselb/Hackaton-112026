@@ -16,7 +16,7 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - BM25 в OpenSearch и reciprocal-rank fusion;
 - финальная проверка `active=true` и `status=ready` по PostgreSQL;
 - опциональный локальный CrossEncoder reranking после проверки активности;
-- опциональный bounded LangGraph agent с evidence assessment и answer validation;
+- bounded AI-Агент по умолчанию с input guardrails, evidence assessment и fail-closed answer validation;
 - локальный ответ Ollama с numbered sources и проверкой номеров цитат;
 - traces, timings и token counts в PostgreSQL;
 - деактивация и восстановление документов;
@@ -26,10 +26,9 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - опциональный публичный demo ingress: production React через Caddy Basic Auth и Tailscale Funnel;
 - неблокирующие конфигурируемые лимиты параллельных ask/ingest в публичном режиме.
 
-Bounded LangGraph agent и CrossEncoder reranker реализованы за независимыми флагами
-и оставлены выключенными по умолчанию. CLIP-006 улучшил корректность отказов, но
-добавил около 3,5 секунды mean latency и показал небольшую регрессию автоматической
-required-facts метрики, поэтому baseline остаётся default.
+AI-Агент и CrossEncoder reranker реализованы за независимыми флагами. После CLIP-012
+AI-Агент включён по умолчанию для новых конфигураций; Базовый RAG сохранён для явного
+сравнения. Существующий `.env` с `AGENT_ENABLED=false` не изменяется автоматически.
 
 ## Изоляция данных
 
@@ -67,10 +66,11 @@ Reranker настраивается через `RERANK_ENABLED`, `RERANK_MODEL`,
 `RERANK_MODEL_REVISION`, `RERANK_DEVICE`, `RERANK_CANDIDATES` и
 `RERANK_TOP_K`; без явного включения модель не загружается.
 
-Agent настраивается через `AGENT_ENABLED`, `AGENT_MAX_SEARCH_CALLS`,
-`AGENT_MAX_RETRIES` и `AGENT_MAX_LLM_CALLS`. Defaults: `false`, 3, 1 и 4.
-При исключении agent runtime запрос контролируемо выполняется существующим RAG,
-а причина fallback сохраняется в trace.
+AI-Агент настраивается через `AGENT_ENABLED`, `AGENT_MAX_SEARCH_CALLS`,
+`AGENT_MAX_RETRIES` и `AGENT_MAX_LLM_CALLS`. Defaults: `true`, 3, 1 и 4.
+При исключении agent runtime возвращается контролируемый `technical_error`; автоматический
+переход в Базовый RAG запрещён. Strict outcome и порядок безопасного обновления стенда:
+[docs/CLIP012_STRICT_AGENT.md](docs/CLIP012_STRICT_AGENT.md).
 
 Для локальной браузерной демонстрации можно отдельно установить
 `AGENT_DEMO_OVERRIDE_ENABLED=true`. Тогда UI показывает request-level выбор режима;
@@ -202,7 +202,8 @@ Smoke следует запускать на свежих проектных р�
 - `GET /api/v1/admin/traces/{id}` — ответ, evidence и безопасная проекция trajectory;
 - `POST /api/v1/traces/{id}/feedback` — оценка ответа владельцем trace.
 
-`status=ok` означает только техническое завершение. Dashboard не выдаёт его за
+`status=ok` означает только техническое завершение. `/api/v1/ask` дополнительно возвращает
+`outcome` и безопасный `reason_code`. Dashboard не выдаёт технический статус за
 правильность ответа: без gold/expert signal поле корректности остаётся `not_measured`,
 а обычный сформированный ответ получает quality status `unknown`. Схема классификации и
 API описаны в [docs/reports/CLIP007_ANALYTICS.md](docs/reports/CLIP007_ANALYTICS.md).

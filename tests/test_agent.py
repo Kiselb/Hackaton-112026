@@ -157,6 +157,7 @@ def test_simple_route_skips_planner():
         "validate_answer",
         "finish",
     ]
+    assert state["outcome"] == "answered"
 
 
 def test_multi_aspect_plan_preserves_original_question():
@@ -238,21 +239,21 @@ def test_no_evidence_produces_controlled_abstention():
 
     assert state["status"] == "abstained"
     assert state["refusal_reason"] == "no_evidence"
-    assert "достаточно данных" in state["answer"].lower()
+    assert "достаточного подтверждения" in state["answer"].lower()
 
 
 def test_invalid_citations_are_repaired_within_budget():
     retriever = Retriever()
     llm = ScriptedLlm(draft="Ответ с ошибочной ссылкой [99].")
-    state = agent(retriever, llm, llm_calls=3).invoke(
+    state = agent(retriever, llm, llm_calls=4).invoke(
         "Какой лимит установлен?", "u", "s", "r"
     )
 
     assert state["answer"] == "Исправленный ответ [1]."
     assert state["validation"]["citations_valid"] is True
     assert state["validation"]["citation_repair_attempted"] is True
-    assert state["llm_calls"] == 3
-    assert state["llm_calls"] <= 3
+    assert state["llm_calls"] == 4
+    assert state["llm_calls"] <= 4
 
 
 def test_trace_contains_identity_trajectory_and_counts():
@@ -292,7 +293,7 @@ def test_invocations_do_not_share_user_or_session_state():
     assert first["step_count"] == second["step_count"]
 
 
-def test_agent_exception_falls_back_to_existing_rag(monkeypatch):
+def test_agent_exception_returns_technical_error_without_baseline(monkeypatch):
     from clip_agent import main
 
     class FakeDb:
@@ -307,30 +308,11 @@ def test_agent_exception_falls_back_to_existing_rag(monkeypatch):
         def commit(self):
             pass
 
-    class Response:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {
-                "message": {"content": "Baseline answer [1]."},
-                "prompt_eval_count": 11,
-                "eval_count": 4,
-                "done_reason": "stop",
-            }
-
     def fail_agent(*args, **kwargs):
         raise RuntimeError("agent failed")
 
-    evidence = source()
     monkeypatch.setattr(main.settings, "agent_enabled", True)
     monkeypatch.setattr(main, "run_agent", fail_agent)
-    monkeypatch.setattr(
-        main,
-        "retrieve",
-        lambda question: ([evidence], 1, trace()),
-    )
-    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: Response())
     db = FakeDb()
 
     result = main.ask(
@@ -338,8 +320,126 @@ def test_agent_exception_falls_back_to_existing_rag(monkeypatch):
         db,
     )
 
-    assert result["answer"] == "Baseline answer [1]."
-    assert result["metrics"]["agent_enabled"] is False
-    assert result["metrics"]["agent_fallback_reason"] == "agent_runtime_error"
-    assert db.trace.details["mode"] == "baseline"
-    assert db.trace.details["agent_fallback_reason"] == "agent failed"
+    assert result["outcome"] == "technical_error"
+    assert result["metrics"]["agent_enabled"] is True
+    assert result["reason_code"] == "agent_runtime_error"
+    assert db.trace.details["mode"] == "langgraph_agent"
+    assert db.trace.details["fallback_attempted"] is False
+    assert db.trace.details["error"] == "agent failed"
+
+
+def test_invalid_validator_json_fails_closed():
+    class InvalidValidator(ScriptedLlm):
+        def __call__(self, prompt: str):
+            if "Validate whether" in prompt:
+                self.calls.append(prompt)
+                return "not-json", {"prompt_eval_count": 2, "eval_count": 1}
+            return super().__call__(prompt)
+
+    state = agent(Retriever(), InvalidValidator()).invoke(
+        "Какой лимит установлен?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "technical_error"
+    assert state["status"] == "failed"
+    assert "grounding_validator_invalid_json" in state["validation"]["llm_failures"]
+
+
+def test_unsupported_scope_conclusion_is_not_published():
+    class RejectingValidator(ScriptedLlm):
+        def __call__(self, prompt: str):
+            if "Validate whether" in prompt:
+                self.calls.append(prompt)
+                return json.dumps(
+                    {
+                        "valid": False,
+                        "unsupported_claims": [],
+                        "scope_errors": ["правило другого подразделения"],
+                    }
+                ), {"prompt_eval_count": 2, "eval_count": 1}
+            return super().__call__(prompt)
+
+    state = agent(Retriever(), RejectingValidator()).invoke(
+        "Применяется ли правило к другому подразделению?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "quality_review_required"
+    assert "другого подразделения" not in state["answer"]
+    assert state["refusal_reason"] == "answer_validation_failed"
+
+
+def test_real_source_ambiguity_returns_specific_clarification():
+    class TwoSources:
+        def __call__(self, query: str, limit: int | None):
+            return [source("presale"), source("delivery")], 2, trace()
+
+    class AmbiguityLlm(ScriptedLlm):
+        def __call__(self, prompt: str):
+            if "Assess evidence" in prompt:
+                self.calls.append(prompt)
+                return json.dumps(
+                    {
+                        "outcome": "clarification_required",
+                        "reason_code": "ambiguous_process_scope",
+                        "clarification_question": (
+                            "Уточните, пожалуйста, подразделение и этап процесса: "
+                            "пресейл или реализация проекта?"
+                        ),
+                        "conflicts": [],
+                        "aspects": [
+                            {
+                                "aspect_id": "aspect-1",
+                                "sufficient": True,
+                                "source_ids": ["presale", "delivery"],
+                                "reason": "different process scopes",
+                            }
+                        ],
+                    }
+                ), {"prompt_eval_count": 2, "eval_count": 1}
+            return super().__call__(prompt)
+
+    state = agent(TwoSources(), AmbiguityLlm()).invoke("Кто назначает РП?", "u", "s", "r")
+
+    assert state["outcome"] == "clarification_required"
+    assert "пресейл или реализация" in state["answer"]
+    assert state["llm_calls"] == 1
+
+
+def test_two_source_conflict_is_reported_without_choosing_priority():
+    class TwoSources:
+        def __call__(self, query: str, limit: int | None):
+            return [source("rule-a"), source("rule-b")], 2, trace()
+
+    class ConflictLlm(ScriptedLlm):
+        def __call__(self, prompt: str):
+            if "Assess evidence" in prompt:
+                self.calls.append(prompt)
+                return json.dumps(
+                    {
+                        "outcome": "conflict_detected",
+                        "reason_code": "conflicting_provisions",
+                        "clarification_question": "",
+                        "conflicts": [
+                            {
+                                "source_ids": ["rule-a", "rule-b"],
+                                "summary": "Документы устанавливают разные сроки.",
+                            }
+                        ],
+                        "aspects": [
+                            {
+                                "aspect_id": "aspect-1",
+                                "sufficient": True,
+                                "source_ids": ["rule-a", "rule-b"],
+                                "reason": "conflict",
+                            }
+                        ],
+                    }
+                ), {"prompt_eval_count": 2, "eval_count": 1}
+            return super().__call__(prompt)
+
+    state = agent(TwoSources(), ConflictLlm()).invoke("Какой срок установлен?", "u", "s", "r")
+
+    assert state["outcome"] == "conflict_detected"
+    assert "[1]" in state["answer"] and "[2]" in state["answer"]
+    assert "приоритет документов нельзя" in state["answer"]
+    assert "службу качества" in state["answer"]

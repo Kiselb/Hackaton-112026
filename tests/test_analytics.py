@@ -230,6 +230,16 @@ def test_serialized_baseline_is_never_labeled_as_agent():
     assert result["mode"] == "baseline"
 
 
+def test_invalid_input_is_not_mislabeled_as_missing_evidence():
+    result = classify_trace(
+        make_trace(details={"mode": "langgraph_agent", "outcome": "invalid_input"})
+    )
+
+    assert result["outcome"] == "invalid_input"
+    assert "no_evidence" not in result["categories"]
+    assert "justified_abstention" in result["categories"]
+
+
 def test_request_level_agent_override_is_disabled_by_default(monkeypatch):
     from clip_agent import main
 

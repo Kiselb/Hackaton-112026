@@ -9,6 +9,15 @@ from .db import SearchTrace
 
 FEEDBACK_RATINGS = {"helpful", "incomplete", "incorrect", "missing_documents"}
 TECHNICAL_SUCCESS_STATUSES = {"ok"}
+CONTENT_OUTCOMES = {
+    "answered",
+    "clarification_required",
+    "quality_review_required",
+    "conflict_detected",
+    "out_of_scope",
+    "invalid_input",
+    "technical_error",
+}
 JUSTIFIED_REFUSAL_REASONS = {
     "no_evidence",
     "temporal_evidence_gap",
@@ -59,8 +68,10 @@ def classify_trace(
     """Return overlapping deterministic outcome labels without judging correctness."""
     details = _details(trace)
     feedback = set(feedback_ratings)
-    technical_error = trace.status not in TECHNICAL_SUCCESS_STATUSES
-    no_evidence = not technical_error and (
+    recorded_outcome = details.get("outcome")
+    outcome = recorded_outcome if recorded_outcome in CONTENT_OUTCOMES else None
+    technical_error = trace.status not in TECHNICAL_SUCCESS_STATUSES or outcome == "technical_error"
+    no_evidence = not technical_error and outcome not in {"out_of_scope", "invalid_input"} and (
         trace.retrieved_count == 0 or details.get("refusal_reason") == "no_evidence"
     )
     refusal_reason = _refusal_reason(details, no_evidence)
@@ -71,15 +82,24 @@ def classify_trace(
     citations_valid = _citations_valid(details)
     citation_problem = trace.selected_count > 0 and citations_valid is False
     fallback, agent_fallback = _has_fallback(details)
-    justified_abstention = refusal_reason in JUSTIFIED_REFUSAL_REASONS
+    justified_abstention = refusal_reason in JUSTIFIED_REFUSAL_REASONS or outcome in {
+        "clarification_required",
+        "quality_review_required",
+        "conflict_detected",
+        "out_of_scope",
+        "invalid_input",
+    }
     manual_review = (
         no_evidence
         or evidence_gap
         or citation_problem
         or agent_fallback
+        or outcome in {"clarification_required", "quality_review_required", "conflict_detected"}
         or bool(feedback & {"incomplete", "incorrect", "missing_documents"})
     )
-    answer_produced = bool(trace.answer) and not technical_error and not justified_abstention
+    answer_produced = bool(trace.answer) and not technical_error and (
+        outcome == "answered" if outcome else not justified_abstention
+    )
 
     flags = {
         "technical_error": technical_error,
@@ -107,6 +127,7 @@ def classify_trace(
         "refusal_reason": refusal_reason,
         "fallback": fallback,
         "citations_valid": citations_valid,
+        "outcome": outcome,
     }
 
 

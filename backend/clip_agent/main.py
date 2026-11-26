@@ -16,15 +16,18 @@ from .analytics import FEEDBACK_RATINGS, aggregate_traces, classify_trace, trace
 from .answering import (
     build_answer_prompt,
     build_citation_repair_prompt,
+    build_grounding_validation_prompt,
     build_temporal_abstention,
     citation_ids_admissible,
     merge_ollama_usage,
+    parse_grounding_validation,
     requires_temporal_abstention,
 )
 from .chunking import chunk_text
 from .config import get_settings
 from .db import Chunk, Document, SearchTrace, SessionLocal, TraceFeedback, init_db
 from .extract import extract_text
+from .guardrails import assess_input
 from .load_control import RequestGate, slot_dependency
 from .search import index_chunks, opensearch, qdrant, retrieve
 
@@ -70,7 +73,7 @@ def startup() -> None:
 
 
 class AskRequest(BaseModel):
-    question: str = Field(min_length=2, max_length=4000)
+    question: str = Field(max_length=4000)
     user_id: str = "demo-user"
     session_id: str = "demo-session"
     mode: Literal["baseline", "agent"] | None = None
@@ -238,7 +241,21 @@ def ask(
     )
     db.add(trace)
     db.commit()
-    agent_fallback_reason = None
+    mode = "langgraph_agent" if use_agent else "baseline"
+    input_assessment = assess_input(payload.question)
+    if not input_assessment.allowed:
+        return _finish_controlled(
+            db,
+            trace,
+            started,
+            mode=mode,
+            outcome=input_assessment.outcome or "invalid_input",
+            reason_code=input_assessment.reason_code or "invalid_input",
+            answer=input_assessment.message or "Запрос не может быть обработан.",
+            agent_enabled=use_agent,
+            details={"input_guard": "rejected"},
+        )
+
     if use_agent:
         try:
             result = run_agent(
@@ -248,55 +265,149 @@ def ask(
                 str(trace.id),
             )
         except Exception as exc:
-            agent_fallback_reason = str(exc)
-        else:
-            latency_ms = round((time.perf_counter() - started) * 1000)
-            sources = result["sources"]
-            usage = result["usage"]
-            retrieval_trace = result["retrieval"]
-            details = result["trace_details"]
-            validation = details.get("validation", {})
-            trace.answer = result["answer"]
-            trace.retrieved_count = result["retrieved_count"]
-            trace.selected_count = len(sources)
-            trace.prompt_tokens = usage.get("prompt_eval_count")
-            trace.completion_tokens = usage.get("eval_count")
-            trace.latency_ms = latency_ms
-            trace.status = "ok"
-            trace.details = details
-            db.commit()
-            return {
-                "answer": result["answer"],
-                "sources": sources,
-                "retrieval": _redact_internal_errors(retrieval_trace),
-                "trace_id": str(trace.id),
-                "metrics": {
-                    "latency_ms": latency_ms,
-                    "prompt_tokens": trace.prompt_tokens,
-                    "completion_tokens": trace.completion_tokens,
-                    "retrieved_count": result["retrieved_count"],
-                    "selected_count": len(sources),
-                    "done_reason": None,
-                    "citations_valid": validation.get("citations_valid", False),
-                    "empty_answer": not bool(result["answer"]),
-                    "citation_repair_attempted": validation.get(
-                        "citation_repair_attempted", False
-                    ),
-                    "temporal_guard_applied": (
-                        details.get("refusal_reason") == "temporal_evidence_gap"
-                    ),
-                    "rerank_status": retrieval_trace["status"],
-                    "rerank_latency_ms": retrieval_trace["latency_ms"],
-                    "rerank_fallback_reason": (
-                        "reranker_fallback" if retrieval_trace["fallback_reason"] else None
-                    ),
-                    "agent_enabled": True,
-                    "agent_search_calls": details.get("search_calls", 0),
-                    "agent_llm_calls": details.get("llm_calls", 0),
-                    "agent_steps": details.get("step_count", 0),
-                    "agent_retries": details.get("retries", 0),
-                },
-            }
+            return _finish_controlled(
+                db,
+                trace,
+                started,
+                mode=mode,
+                outcome="technical_error",
+                reason_code="agent_runtime_error",
+                answer=(
+                    "Не удалось завершить обработку в режиме AI-Агента. "
+                    "Неподтверждённый ответ не опубликован. Пожалуйста, повторите запрос позже."
+                ),
+                agent_enabled=True,
+                details={"error": str(exc), "fallback_attempted": False},
+            )
+        latency_ms = round((time.perf_counter() - started) * 1000)
+        sources = result["sources"]
+        usage = result["usage"]
+        retrieval_trace = result["retrieval"]
+        details = result["trace_details"]
+        validation = details.get("validation", {})
+        outcome = details.get("outcome", "technical_error")
+        reason_code = details.get("reason_code") or details.get("refusal_reason")
+        trace.answer = result["answer"]
+        trace.retrieved_count = result["retrieved_count"]
+        trace.selected_count = len(sources)
+        trace.prompt_tokens = usage.get("prompt_eval_count")
+        trace.completion_tokens = usage.get("eval_count")
+        trace.latency_ms = latency_ms
+        trace.status = "failed" if outcome == "technical_error" else "ok"
+        trace.details = {**details, "outcome": outcome, "reason_code": reason_code}
+        db.commit()
+        return {
+            "answer": result["answer"],
+            "sources": sources,
+            "retrieval": _redact_internal_errors(retrieval_trace),
+            "trace_id": str(trace.id),
+            "outcome": outcome,
+            "reason_code": reason_code,
+            "metrics": {
+                "latency_ms": latency_ms,
+                "prompt_tokens": trace.prompt_tokens,
+                "completion_tokens": trace.completion_tokens,
+                "retrieved_count": result["retrieved_count"],
+                "selected_count": len(sources),
+                "done_reason": None,
+                "citations_valid": validation.get("citations_valid", False),
+                "empty_answer": not bool(result["answer"]),
+                "citation_repair_attempted": validation.get("citation_repair_attempted", False),
+                "temporal_guard_applied": reason_code == "temporal_evidence_gap",
+                "rerank_status": retrieval_trace["status"],
+                "rerank_latency_ms": retrieval_trace["latency_ms"],
+                "rerank_fallback_reason": (
+                    "reranker_fallback" if retrieval_trace["fallback_reason"] else None
+                ),
+                "agent_enabled": True,
+                "agent_search_calls": details.get("search_calls", 0),
+                "agent_llm_calls": details.get("llm_calls", 0),
+                "agent_steps": details.get("step_count", 0),
+                "agent_retries": details.get("retries", 0),
+            },
+        }
+
+    return _run_baseline(payload, db, trace, started)
+
+
+def _finish_controlled(
+    db: Session,
+    trace: SearchTrace,
+    started: float,
+    *,
+    mode: str,
+    outcome: str,
+    reason_code: str,
+    answer: str,
+    agent_enabled: bool,
+    sources: list[dict] | None = None,
+    retrieved_count: int = 0,
+    retrieval: dict | None = None,
+    details: dict | None = None,
+    usage: dict | None = None,
+) -> dict:
+    sources = sources or []
+    usage = usage or {}
+    retrieval = retrieval or {
+        "enabled": False,
+        "status": "not_run",
+        "latency_ms": 0.0,
+        "fallback_reason": None,
+    }
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    trace.answer = answer
+    trace.retrieved_count = retrieved_count
+    trace.selected_count = len(sources)
+    trace.prompt_tokens = usage.get("prompt_eval_count")
+    trace.completion_tokens = usage.get("eval_count")
+    trace.latency_ms = latency_ms
+    trace.status = "failed" if outcome == "technical_error" else "ok"
+    trace.details = {
+        "mode": mode,
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "source_ids": [source.get("chunk_id") for source in sources],
+        "llm_calls": 0,
+        **(details or {}),
+    }
+    db.commit()
+    return {
+        "answer": answer,
+        "sources": sources,
+        "retrieval": _redact_internal_errors(retrieval),
+        "trace_id": str(trace.id),
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "metrics": {
+            "latency_ms": latency_ms,
+            "prompt_tokens": trace.prompt_tokens,
+            "completion_tokens": trace.completion_tokens,
+            "retrieved_count": retrieved_count,
+            "selected_count": len(sources),
+            "citations_valid": False,
+            "empty_answer": False,
+            "done_reason": usage.get("done_reason"),
+            "citation_repair_attempted": bool(
+                (details or {}).get("citation_repair_attempted", False)
+            ),
+            "temporal_guard_applied": reason_code == "temporal_evidence_gap",
+            "rerank_status": retrieval.get("status"),
+            "rerank_latency_ms": retrieval.get("latency_ms"),
+            "rerank_fallback_reason": (
+                "reranker_fallback" if retrieval.get("fallback_reason") else None
+            ),
+            "agent_enabled": agent_enabled,
+            "agent_search_calls": 0,
+            "agent_llm_calls": int((details or {}).get("llm_calls", 0)),
+            "agent_steps": 0,
+            "agent_retries": 0,
+        },
+    }
+
+
+def _run_baseline(
+    payload: AskRequest, db: Session, trace: SearchTrace, started: float
+) -> dict:
     citation_repair_attempted = False
     citation_repair_error = None
     temporal_guard_applied = False
@@ -304,13 +415,28 @@ def ask(
     try:
         sources, retrieved_count, retrieval_trace = retrieve(payload.question)
         if not sources:
-            answer = "В активных документах не найдено достаточно данных для ответа."
-            usage = {}
+            return _finish_controlled(
+                db,
+                trace,
+                started,
+                mode="baseline",
+                outcome="quality_review_required",
+                reason_code="no_evidence",
+                answer=(
+                    "В доступных регламентах не найдено достаточного подтверждения для "
+                    "однозначного ответа. Предлагаю обратиться в службу качества."
+                ),
+                agent_enabled=False,
+                retrieved_count=retrieved_count,
+                retrieval=retrieval_trace,
+            )
         elif requires_temporal_abstention(payload.question, sources):
             answer = build_temporal_abstention(sources)
             usage = {}
             citations_valid = citation_ids_admissible(answer, len(sources))
             temporal_guard_applied = True
+            outcome = "quality_review_required"
+            reason_code = "temporal_evidence_gap"
         else:
             prompt = build_answer_prompt(payload.question, sources)
             response = httpx.post(
@@ -332,31 +458,7 @@ def ask(
             llm_calls += 1
             answer = usage["message"]["content"].strip()
             if not answer:
-                latency_ms = round((time.perf_counter() - started) * 1000)
-                trace.answer = ""
-                trace.retrieved_count = retrieved_count
-                trace.selected_count = len(sources)
-                trace.prompt_tokens = usage.get("prompt_eval_count")
-                trace.completion_tokens = usage.get("eval_count")
-                trace.latency_ms = latency_ms
-                trace.status = "empty"
-                trace.details = {
-                    "mode": "baseline",
-                    "agent_fallback_reason": agent_fallback_reason,
-                    "source_ids": [source["chunk_id"] for source in sources],
-                    "done_reason": usage.get("done_reason"),
-                    "llm_calls": llm_calls,
-                    "ollama": ollama_metrics(usage),
-                    "reranking": retrieval_trace,
-                }
-                db.commit()
-                raise HTTPException(
-                    503,
-                    detail={
-                        "message": "Ollama returned an empty answer",
-                        "done_reason": usage.get("done_reason"),
-                    },
-                )
+                raise RuntimeError("Ollama returned an empty answer")
             citations_valid = citation_ids_admissible(answer, len(sources))
             if not citations_valid:
                 citation_repair_attempted = True
@@ -393,10 +495,77 @@ def ask(
                     citation_repair_error = str(exc)
                 citations_valid = citation_ids_admissible(answer, len(sources))
             if not citations_valid:
-                answer += (
-                    "\n\nПримечание: автоматическая проверка не подтвердила "
-                    "корректные номера цитат."
+                return _finish_controlled(
+                    db,
+                    trace,
+                    started,
+                    mode="baseline",
+                    outcome="quality_review_required",
+                    reason_code="invalid_or_missing_citations",
+                    answer=(
+                        "По найденным источникам нельзя надёжно подтвердить ответ: проверка "
+                        "цитат не пройдена. Предлагаю обратиться в службу качества."
+                    ),
+                    agent_enabled=False,
+                    sources=sources,
+                    retrieved_count=retrieved_count,
+                    retrieval=retrieval_trace,
+                    usage=usage,
+                    details={
+                        "citation_repair_attempted": citation_repair_attempted,
+                        "citation_repair_error": citation_repair_error,
+                        "llm_calls": llm_calls,
+                    },
                 )
+
+            validation_response = httpx.post(
+                f"{settings.ollama_url}/api/chat",
+                json={
+                    "model": settings.ollama_model,
+                    "stream": False,
+                    "think": settings.ollama_think,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": build_grounding_validation_prompt(
+                                payload.question, answer, sources
+                            ),
+                        }
+                    ],
+                    "options": {
+                        "temperature": settings.ollama_temperature,
+                        "num_predict": settings.ollama_num_predict,
+                    },
+                },
+                timeout=300,
+            )
+            validation_response.raise_for_status()
+            validation_usage = validation_response.json()
+            llm_calls += 1
+            usage = merge_ollama_usage(usage, validation_usage)
+            validation_text = validation_usage["message"]["content"].strip()
+            grounded, validation_failures = parse_grounding_validation(validation_text)
+            if not grounded:
+                return _finish_controlled(
+                    db,
+                    trace,
+                    started,
+                    mode="baseline",
+                    outcome="quality_review_required",
+                    reason_code="answer_validation_failed",
+                    answer=(
+                        "По найденным источникам нельзя надёжно подтвердить итоговый вывод. "
+                        "Неподтверждённый ответ не опубликован. Предлагаю обратиться в службу качества."
+                    ),
+                    agent_enabled=False,
+                    sources=sources,
+                    retrieved_count=retrieved_count,
+                    retrieval=retrieval_trace,
+                    usage=usage,
+                    details={"validation_failures": validation_failures, "llm_calls": llm_calls},
+                )
+            outcome = "answered"
+            reason_code = "grounded_answer"
         latency_ms = round((time.perf_counter() - started) * 1000)
         trace.answer = answer
         trace.retrieved_count = retrieved_count
@@ -407,7 +576,8 @@ def ask(
         trace.status = "ok"
         trace.details = {
             "mode": "baseline",
-            "agent_fallback_reason": agent_fallback_reason,
+            "outcome": outcome,
+            "reason_code": reason_code,
             "source_ids": [source["chunk_id"] for source in sources],
             "done_reason": usage.get("done_reason"),
             "citations_valid": citations_valid if sources else False,
@@ -425,6 +595,8 @@ def ask(
             "sources": sources,
             "retrieval": _redact_internal_errors(retrieval_trace),
             "trace_id": str(trace.id),
+            "outcome": outcome,
+            "reason_code": reason_code,
             "metrics": {
                 "latency_ms": latency_ms,
                 "prompt_tokens": trace.prompt_tokens,
@@ -442,25 +614,24 @@ def ask(
                     "reranker_fallback" if retrieval_trace["fallback_reason"] else None
                 ),
                 "agent_enabled": False,
-                "agent_fallback_reason": (
-                    "agent_runtime_error" if agent_fallback_reason else None
-                ),
                 **ollama_metrics(usage),
             },
         }
-    except HTTPException:
-        raise
     except Exception as exc:
-        trace.status = "failed"
-        trace.latency_ms = round((time.perf_counter() - started) * 1000)
-        trace.details = {
-            "mode": "baseline",
-            "agent_fallback_reason": agent_fallback_reason,
-            "error": str(exc),
-            "llm_calls": llm_calls,
-        }
-        db.commit()
-        raise HTTPException(503, detail="Локальный RAG недоступен") from exc
+        return _finish_controlled(
+            db,
+            trace,
+            started,
+            mode="baseline",
+            outcome="technical_error",
+            reason_code="baseline_runtime_error",
+            answer=(
+                "Не удалось завершить обработку запроса. Неподтверждённый ответ не "
+                "опубликован. Пожалуйста, повторите запрос позже."
+            ),
+            agent_enabled=False,
+            details={"error": str(exc), "llm_calls": llm_calls},
+        )
 
 
 def ollama_metrics(payload: dict) -> dict:
@@ -553,6 +724,8 @@ def _serialize_trace(
         "status": row.status,
         "technical_status": classification["technical_status"],
         "quality_status": classification["quality_status"],
+        "outcome": classification["outcome"],
+        "reason_code": row.details.get("reason_code") if isinstance(row.details, dict) else None,
         "categories": classification["categories"],
         "latency_ms": row.latency_ms,
         "prompt_tokens": row.prompt_tokens,

@@ -50,6 +50,12 @@ select, input { border: 1px solid #bcc9c2; border-radius: 8px; padding: .62rem .
 .citation { display: inline-block; color: #0d6848; font-weight: 800; text-decoration: none; border-bottom: 2px solid #9bd2bc; line-height: 1.2; }
 .citation:hover { background: #dff4eb; }
 .invalid-citation { color: #9b3434; font-weight: 800; }
+.outcome { width: max-content; max-width: 100%; margin-top: .85rem; border-radius: 999px; padding: .38rem .7rem; background: #e9efec; color: #43564e; font-size: .78rem; font-weight: 800; }
+.outcome-answered { background: #ddf3e7; color: #155b3e; }
+.outcome-clarification_required { background: #fff3cd; color: #715a05; }
+.outcome-quality_review_required, .outcome-conflict_detected { background: #fff0d9; color: #7c4a0d; }
+.outcome-out_of_scope, .outcome-invalid_input { background: #edf0f5; color: #4e596d; }
+.outcome-technical_error { background: #fde3e3; color: #882f2f; }
 .answer-meta, .trace-meta, .chips { display: flex; flex-wrap: wrap; gap: .45rem; }
 .answer-meta span, .trace-meta span, .chips span { border-radius: 999px; padding: .35rem .62rem; background: #eef3f0; color: #4f625a; font-size: .75rem; }
 .feedback { display: grid; gap: .45rem; border-top: 1px solid #e3e8e5; margin-top: 1rem; padding-top: 1rem; }

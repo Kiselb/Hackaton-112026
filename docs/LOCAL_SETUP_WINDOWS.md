@@ -90,7 +90,7 @@ RERANK_MODEL_REVISION=
 RERANK_DEVICE=cpu
 RERANK_CANDIDATES=24
 RERANK_TOP_K=8
-AGENT_ENABLED=false
+AGENT_ENABLED=true
 AGENT_MAX_SEARCH_CALLS=3
 AGENT_MAX_RETRIES=1
 AGENT_MAX_LLM_CALLS=4
@@ -107,9 +107,11 @@ Reranker загружается лениво только при RERANK_ENABLED=
 разрешить более новую версию модели. Reranker работает на CPU и не меняет размещение
 Ollama на GPU.
 
-Bounded LangGraph agent также выключен по умолчанию. Он использует тот же локальный
-Qwen и существующий hybrid retrieval; лимиты search/retry/LLM применяются при каждом
-исполнении. Отдельные внешние API и shared memory не используются.
+Bounded AI-Агент включён по умолчанию для новых конфигураций. Он использует тот же
+локальный Qwen и существующий hybrid retrieval; лимиты search/retry/LLM применяются при
+каждом исполнении. При runtime error автоматический fallback в Базовый RAG не выполняется.
+Отдельные внешние API и shared memory не используются. Существующий `.env` не
+перезаписывается: владелец меняет `AGENT_ENABLED` вручную только в согласованное окно.
 
 Для воспроизводимой локальной демонстрации trajectory можно оставить
 `AGENT_ENABLED=false`, установить `AGENT_DEMO_OVERRIDE_ENABLED=true` и перезапустить
