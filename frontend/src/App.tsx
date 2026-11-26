@@ -29,6 +29,12 @@ type Source = {
   child_text: string;
   child_start: number;
   child_end: number;
+  source_type?: "corporate_document" | "quality_clarification";
+  quality_request_number?: string;
+  quality_knowledge_entry_id?: string;
+  approval_number?: string;
+  approved_at?: string;
+  scope?: string;
 };
 
 type DocumentItem = {
@@ -49,6 +55,13 @@ type Analytics = {
   clarifications: number;
   confirmed_answers: number;
   quality_review_transitions: number;
+  quality_requests_created: number;
+  quality_emails_sent: number;
+  quality_email_failures: number;
+  quality_requests_pending: number;
+  quality_knowledge_approved: number;
+  quality_knowledge_published: number;
+  quality_requests_rejected: number;
   technical_errors: number;
   justified_abstentions: number;
   manual_review_required: number;
@@ -176,8 +189,47 @@ type Capabilities = {
   };
 };
 
+type QualityDraft = {
+  title: string;
+  answer: string;
+  scope: string;
+  conditions: string;
+  expert_label: string;
+};
+
+type QualityEntry = {
+  id: string;
+  version: number;
+  approval_number: string;
+  status: string;
+  document_id: string | null;
+  approved_at: string;
+};
+
+type QualityRequestItem = {
+  id: string;
+  public_number: string;
+  trace_id: string;
+  question: string;
+  reason_code: string;
+  source_outcome: Outcome;
+  status: string;
+  email_status: string;
+  email_error_category: string | null;
+  draft: QualityDraft;
+  created_at: string;
+  knowledge_entries?: QualityEntry[];
+};
+
 const defaultQuestion =
   "Какие пени применяются за просрочку предоплаты и почему в документах указаны разные ставки?";
+
+function initialQuestion(): string {
+  const repeated = sessionStorage.getItem("clip-repeat-question");
+  if (!repeated) return defaultQuestion;
+  sessionStorage.removeItem("clip-repeat-question");
+  return repeated;
+}
 
 const categoryLabels: Record<string, string> = {
   technical_error: "Техническая ошибка",
@@ -265,7 +317,11 @@ function SourceCard({source, index, anchorPrefix = "source"}: {
       <div><span className="source-number">[{index + 1}]</span><h3>{source.title}</h3></div>
       {source.page != null && <span className="page">стр. {source.page}</span>}
     </div>
-    <small>{source.filename}</small>
+    {source.source_type === "quality_clarification" ? <div className="quality-source-meta">
+      <b>Экспертное разъяснение службы качества</b>
+      <small>{source.quality_request_number} · {source.approval_number} · {source.approved_at ? formatDate(source.approved_at) : "дата не указана"}</small>
+      {source.scope && <small>Область применения: {source.scope}</small>}
+    </div> : <small>{source.filename}</small>}
     <p className="child-excerpt">{source.child_text}</p>
     <details>
       <summary>Показать родительский контекст</summary>
@@ -327,8 +383,57 @@ function MetricCard({value, label, note}: {value: ReactNode; label: string; note
   return <div className="metric-card"><b>{value}</b><span>{label}</span>{note && <small>{note}</small>}</div>;
 }
 
+function QualityEscalation({traceId, conversationToken}: {
+  traceId: string;
+  conversationToken: string | null;
+}) {
+  const [request, setRequest] = useState<QualityRequestItem | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const idempotencyKey = useRef(sessionStorage.getItem(`clip-quality-${traceId}`) ?? crypto.randomUUID());
+
+  async function createRequest() {
+    if (!conversationToken || busy) return;
+    if (!window.confirm("Создать обращение и запросить отправку уведомления службе качества?")) return;
+    setBusy(true);
+    setError("");
+    try {
+      sessionStorage.setItem(`clip-quality-${traceId}`, idempotencyKey.current);
+      const response = await fetch("/api/v1/quality-requests", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": idempotencyKey.current,
+          [CONVERSATION_TOKEN_HEADER]: conversationToken,
+        },
+        body: JSON.stringify({trace_id: traceId}),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      setRequest(await response.json() as QualityRequestItem);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Обращение не создано");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (request) return <div className="quality-escalation notice compact">
+    <b>Обращение {request.public_number} создано.</b>
+    <span>Статус уведомления: {request.email_status}.</span>
+    {request.email_status === "not_requested" && <span>Письмо не отправлено: SMTP выключен или не настроен.</span>}
+    {request.email_status === "delivery_unknown" && <span>Результат доставки неизвестен; автоматический повтор заблокирован.</span>}
+  </div>;
+  return <div className="quality-escalation">
+    <button className="primary" disabled={!conversationToken || busy} onClick={createRequest} type="button">
+      {busy ? "Создаю обращение…" : "Обратиться в службу качества"}
+    </button>
+    {!conversationToken && <span className="muted">Для обращения нужен защищённый диалог AI-Агента.</span>}
+    {error && <span className="inline-error">{error}</span>}
+  </div>;
+}
+
 function SearchView({capabilities}: {capabilities: Capabilities}) {
-  const [question, setQuestion] = useState(defaultQuestion);
+  const [question, setQuestion] = useState(initialQuestion);
   const [requestedMode, setRequestedMode] = useState<Mode>(capabilities.default_mode);
   const [llmProvider, setLlmProvider] = useState<LlmProvider>(capabilities.llm.default_provider);
   const initialProvider = capabilities.llm.providers.find(
@@ -553,6 +658,8 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
           <span>{formatNumber(message.metrics.completion_tokens)} output tokens</span>
           {message.llm_provider && <span>{message.llm_provider === "openai" ? "OpenAI" : "Ollama"} · {message.llm_model}</span>}
         </div>}
+        {(message.outcome === "quality_review_required" || message.outcome === "conflict_detected") && message.trace_id &&
+          <QualityEscalation traceId={message.trace_id} conversationToken={conversationToken} />}
         {message.trace_id && <FeedbackForm traceId={message.trace_id} userId={DEMO_USER} sessionId={DEMO_SESSION} />}
         {message.sources.length > 0 && <details className="message-sources"><summary>Источники: {message.sources.length}</summary><div className="sources">{message.sources.map((source, index) => <SourceCard source={source} index={index} anchorPrefix={prefix} key={source.chunk_id} />)}</div></details>}
       </article>;
@@ -571,6 +678,13 @@ function AnalyticsView({analytics}: {analytics: Analytics | null}) {
       <MetricCard value={analytics.clarifications} label="Уточнений" />
       <MetricCard value={analytics.confirmed_answers} label="Подтверждённых ответов" />
       <MetricCard value={analytics.quality_review_transitions} label="Переходов в службу качества" />
+      <MetricCard value={analytics.quality_requests_created} label="Создано обращений" />
+      <MetricCard value={analytics.quality_requests_pending} label="Ожидают эксперта" />
+      <MetricCard value={analytics.quality_emails_sent} label="SMTP принято" />
+      <MetricCard value={analytics.quality_email_failures} label="Ошибок/неясных SMTP" />
+      <MetricCard value={analytics.quality_knowledge_approved} label="Утверждено разъяснений" note="операционный показатель" />
+      <MetricCard value={analytics.quality_knowledge_published} label="Опубликовано источников" />
+      <MetricCard value={analytics.quality_requests_rejected} label="Отклонено обращений" />
       <MetricCard value={analytics.total_queries} label="Всего запросов" />
       <MetricCard value={analytics.technical_errors} label="Технических ошибок" />
       <MetricCard value={analytics.justified_abstentions} label="Обоснованных отказов" />
@@ -681,6 +795,119 @@ function TracesView() {
   </section>;
 }
 
+function QualityServiceView({onRepeat}: {onRepeat: (question: string) => void}) {
+  const [approvalToken, setApprovalToken] = useState("");
+  const [rows, setRows] = useState<QualityRequestItem[]>([]);
+  const [selected, setSelected] = useState<QualityRequestItem | null>(null);
+  const [draft, setDraft] = useState<QualityDraft>({title: "", answer: "", scope: "", conditions: "", expert_label: ""});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  function headers(json = false): HeadersInit {
+    return {
+      ...(json ? {"Content-Type": "application/json"} : {}),
+      "X-Quality-Approval-Token": approvalToken,
+    };
+  }
+
+  async function loadRows() {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/v1/quality-requests", {headers: headers()});
+      if (!response.ok) throw new Error(await responseError(response));
+      setRows(await response.json() as QualityRequestItem[]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Обращения не загружены");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openRequest(id: string) {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`/api/v1/quality-requests/${id}`, {headers: headers()});
+      if (!response.ok) throw new Error(await responseError(response));
+      const item = await response.json() as QualityRequestItem;
+      setSelected(item);
+      setDraft(item.draft);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Обращение не открыто");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function action(name: "draft" | "approve" | "publish" | "reject" | "retry-email") {
+    if (!selected) return;
+    setBusy(true);
+    setError("");
+    try {
+      const body = name === "draft" ? draft : name === "reject" ? {expert_label: draft.expert_label} : undefined;
+      const response = await fetch(`/api/v1/quality-requests/${selected.id}/${name}`, {
+        method: "POST",
+        headers: headers(body !== undefined),
+        ...(body !== undefined ? {body: JSON.stringify(body)} : {}),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const item = await response.json() as QualityRequestItem;
+      setSelected(item);
+      setDraft(item.draft);
+      setRows((current) => current.map((row) => row.id === item.id ? item : row));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Операция не выполнена");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <section className="quality-layout">
+    <aside className="panel quality-list">
+      <span className="section-kicker">Демонстрационная роль</span>
+      <h2>Служба качества</h2>
+      <p className="muted">Код проверяет отдельное серверное право, но не подтверждает личность сотрудника.</p>
+      <label className="mode-select">Код сотрудника
+        <input type="password" autoComplete="off" value={approvalToken} onChange={(event) => setApprovalToken(event.target.value)} />
+      </label>
+      <button className="primary" disabled={!approvalToken || busy} onClick={loadRows} type="button">Показать обращения</button>
+      <div className="quality-items">{rows.map((row) => <button className={selected?.id === row.id ? "trace-item selected" : "trace-item"} key={row.id} onClick={() => openRequest(row.id)} type="button">
+        <span><b>{row.public_number}</b><time>{formatDate(row.created_at)}</time></span>
+        <strong>{row.question}</strong>
+        <small>{row.status} · e-mail: {row.email_status}</small>
+      </button>)}</div>
+    </aside>
+    <div className="stack">
+      {error && <div className="error">{error}</div>}
+      {!selected ? <div className="panel empty hero-empty">Введите выданный владельцем код и выберите обращение.</div> : <>
+        <article className="panel stack">
+          <div className="section-title"><div><span className="section-kicker">{selected.public_number}</span><h2>{selected.question}</h2></div><span>{selected.status}</span></div>
+          <div className="answer-meta"><span>Причина: {selected.reason_code}</span><span>e-mail: {selected.email_status}</span></div>
+          {selected.email_error_category && <p className="notice compact">Категория SMTP: {selected.email_error_category}</p>}
+          <button className="secondary" onClick={() => onRepeat(selected.question)} type="button">Повторить вопрос в AI-Агенте</button>
+        </article>
+        <article className="panel quality-editor">
+          <span className="section-kicker">Экспертное разъяснение</span><h2>Draft и утверждение</h2>
+          <label>Заголовок<input maxLength={500} value={draft.title} onChange={(event) => setDraft({...draft, title: event.target.value})} /></label>
+          <label>Утверждённый ответ<textarea maxLength={8000} value={draft.answer} onChange={(event) => setDraft({...draft, answer: event.target.value})} /></label>
+          <label>Область применения<textarea maxLength={2000} value={draft.scope} onChange={(event) => setDraft({...draft, scope: event.target.value})} /></label>
+          <label>Условия и ограничения<textarea maxLength={2000} value={draft.conditions} onChange={(event) => setDraft({...draft, conditions: event.target.value})} /></label>
+          <label>Метка демонстратора<input maxLength={200} value={draft.expert_label} onChange={(event) => setDraft({...draft, expert_label: event.target.value})} /></label>
+          <div className="dialog-actions">
+            <button className="secondary" disabled={busy} onClick={() => action("draft")} type="button">Сохранить draft</button>
+            <button className="primary" disabled={busy || selected.status !== "draft"} onClick={() => action("approve")} type="button">Утвердить версию</button>
+            <button className="primary" disabled={busy || selected.status !== "approved"} onClick={() => action("publish")} type="button">Опубликовать в RAG</button>
+            <button className="secondary danger" disabled={busy || ["approved", "published", "rejected"].includes(selected.status)} onClick={() => action("reject")} type="button">Отклонить</button>
+            {selected.email_status === "failed" && <button className="secondary" disabled={busy} onClick={() => action("retry-email")} type="button">Повторить e-mail</button>}
+          </div>
+          {selected.knowledge_entries && selected.knowledge_entries.length > 0 && <div className="quality-versions"><h3>Неизменяемые версии</h3>{selected.knowledge_entries.map((entry) => <div key={entry.id}><b>v{entry.version} · {entry.approval_number}</b><span>{entry.status} · source: {entry.document_id ?? "ещё не создан"}</span></div>)}</div>}
+        </article>
+      </>}
+    </div>
+  </section>;
+}
+
 function DocumentsView({documents, busy, reload}: {documents: DocumentItem[]; busy: boolean; reload: () => Promise<void>}) {
   const [localBusy, setLocalBusy] = useState(false);
   const [error, setError] = useState("");
@@ -706,7 +933,7 @@ function DocumentsView({documents, busy, reload}: {documents: DocumentItem[]; bu
 }
 
 export default function App() {
-  const [tab, setTab] = useState<"search" | "analytics" | "traces" | "documents">("search");
+  const [tab, setTab] = useState<"search" | "quality" | "analytics" | "traces" | "documents">("search");
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
@@ -741,14 +968,22 @@ export default function App() {
     request?.catch((reason) => setGlobalError(reason instanceof Error ? reason.message : String(reason)));
   }, [tab]);
 
-  const title = useMemo(() => ({search: "Поиск", analytics: "Аналитика", traces: "Трассы", documents: "Документы"})[tab], [tab]);
+  function repeatQualityQuestion(question: string) {
+    sessionStorage.removeItem("clip-conversation-id");
+    sessionStorage.removeItem("clip-conversation-token");
+    sessionStorage.setItem("clip-repeat-question", question);
+    setTab("search");
+  }
+
+  const title = useMemo(() => ({search: "Поиск", quality: "Служба качества", analytics: "Аналитика", traces: "Трассы", documents: "Документы"})[tab], [tab]);
   return <main>
     <header>
       <div><span className="eyebrow">Corporate Intelligence Lab</span><h1>AI-Agent Clip</h1><p>{title}</p></div>
-      <nav>{(["search", "analytics", "traces", "documents"] as const).map((item) => <button className={tab === item ? "active" : ""} key={item} onClick={() => setTab(item)}>{{search: "Поиск", analytics: "Аналитика", traces: "Трассы", documents: "Документы"}[item]}</button>)}</nav>
+      <nav>{(["search", "quality", "analytics", "traces", "documents"] as const).map((item) => <button className={tab === item ? "active" : ""} key={item} onClick={() => setTab(item)}>{{search: "Поиск", quality: "Служба качества", analytics: "Аналитика", traces: "Трассы", documents: "Документы"}[item]}</button>)}</nav>
     </header>
     {globalError && <div className="error">{globalError}</div>}
     {tab === "search" && (capabilities ? <SearchView capabilities={capabilities} /> : <div className="panel empty">Загружаю фактическую конфигурацию backend…</div>)}
+    {tab === "quality" && <QualityServiceView onRepeat={repeatQualityQuestion} />}
     {tab === "analytics" && <AnalyticsView analytics={analytics} />}
     {tab === "traces" && <TracesView />}
     {tab === "documents" && <DocumentsView documents={documents} busy={documentsBusy} reload={loadDocuments} />}

@@ -8,7 +8,13 @@ from sentence_transformers import SentenceTransformer
 from sqlalchemy import select
 
 from .config import get_settings
-from .db import Chunk, Document, SessionLocal
+from .db import (
+    Chunk,
+    Document,
+    QualityKnowledgeEntry,
+    QualityRequest,
+    SessionLocal,
+)
 from .reranking import rerank_candidates
 
 
@@ -131,6 +137,7 @@ def build_active_candidates(
                 "child_end": chunk.child_end,
                 "rrf_score": score,
                 "rank_before_rerank": rank,
+                "source_type": "corporate_document",
             }
         )
     return candidates, by_id
@@ -162,9 +169,39 @@ def retrieve(question: str, limit: int | None = None) -> tuple[list[dict], int, 
             .join(Document, Chunk.document_id == Document.id)
             .where(Chunk.id.in_(candidate_ids), Document.active.is_(True), Document.status == "ready")
         ).all()
+        document_ids = {document.id for _, document in rows}
+        quality_rows = session.execute(
+            select(QualityKnowledgeEntry, QualityRequest)
+            .join(
+                QualityRequest,
+                QualityKnowledgeEntry.quality_request_id == QualityRequest.id,
+            )
+            .where(
+                QualityKnowledgeEntry.document_id.in_(document_ids),
+                QualityKnowledgeEntry.status == "published",
+            )
+        ).all() if document_ids else []
+        quality_by_document = {
+            str(entry.document_id): (entry, request) for entry, request in quality_rows
+        }
     active_candidates, by_id = build_active_candidates(
         fused, rows, settings.rerank_candidates
     )
+    for candidate in active_candidates:
+        quality = quality_by_document.get(candidate["document_id"])
+        if quality is None:
+            continue
+        entry, request = quality
+        candidate.update(
+            {
+                "source_type": "quality_clarification",
+                "quality_request_number": request.public_number,
+                "quality_knowledge_entry_id": str(entry.id),
+                "approval_number": entry.approval_number,
+                "approved_at": entry.approved_at.isoformat(),
+                "scope": entry.scope,
+            }
+        )
     ranked_candidates, rerank_trace = rerank_candidates(question, active_candidates)
     selected: list[dict] = []
     seen_parents: set[tuple[str, int]] = set()

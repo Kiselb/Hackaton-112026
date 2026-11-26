@@ -21,6 +21,9 @@
 - **Observability:** structured node decisions, retrieval details, token counters, response latency, outcomes; DB for MVP, OTel/MLflow/Langfuse later.
 - **Analytics UI:** deterministic overlapping outcome labels over `SearchTrace`, bounded
   list/detail APIs and trace-linked feedback. No LLM judge is required.
+- **Quality service:** trace-bound, user-confirmed escalation; backend-only SMTP;
+  separately authorized expert draft/approval; immutable knowledge versions published as
+  ordinary Documents only after dense+sparse indexing succeeds.
 - **Optional public demo ingress:** Tailscale Funnel HTTPS termination → loopback-only Caddy with
   bcrypt Basic Auth → production React files and loopback-only FastAPI. It reuses the
   same application configuration and stores; it is not another deployment.
@@ -36,6 +39,17 @@
 7. Soft-deactivation hides evidence in indexes and Postgres; source bytes and DB metadata remain for recovery.
 
 Important: a revised regulation is *technical lineage*; replacing a particular business rule across **different orders** requires explicit semantic analysis and cannot be assumed from the latest upload date.
+
+## Quality-service knowledge ingestion
+
+`quality_review_required` and `conflict_detected` may create one `QualityRequest` only
+after the conversation ownership token and idempotency key are checked. Drafts are not
+searchable. A separate demo approval capability snapshots expert-authored text into an
+immutable `QualityKnowledgeEntry`. Publication creates the existing `Document`/`Chunk`
+objects with `active=false,status=indexing`, runs the same Qdrant/OpenSearch pipeline and
+sets `active=true,status=ready` only after both derived indexes complete. Thus partial
+indexing cannot bypass PostgreSQL visibility. Retrieval decorates source provenance but
+keeps ordinary citation, scope, temporal, conflict and grounding checks.
 
 ## Search / answer
 

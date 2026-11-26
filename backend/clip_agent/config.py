@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     conversation_max_user_answers: int = Field(default=3, ge=1, le=10)
     conversation_max_context_chars: int = Field(default=2000, ge=256, le=8000)
     conversation_max_message_chars: int = Field(default=1000, ge=64, le=4000)
+    quality_email_enabled: bool = False
+    quality_email_to: str = ""
+    quality_smtp_host: str = ""
+    quality_smtp_port: int = Field(default=587, ge=1, le=65535)
+    quality_smtp_username: str = ""
+    quality_smtp_password: SecretStr | None = None
+    quality_smtp_from: str = ""
+    quality_smtp_starttls: bool = True
+    quality_smtp_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    quality_email_max_body_chars: int = Field(default=8000, ge=1000, le=20000)
+    quality_request_rate_limit_per_hour: int = Field(default=10, ge=1, le=100)
+    quality_approval_token: SecretStr | None = None
     public_demo_enabled: bool = False
     demo_max_concurrent_llm: int = Field(default=1, ge=1, le=16)
     demo_max_concurrent_ingest: int = Field(default=1, ge=1, le=8)

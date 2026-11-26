@@ -19,6 +19,8 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - bounded AI-Агент по умолчанию с input guardrails, evidence assessment и fail-closed answer validation;
 - request-level выбор локального Ollama или OpenAI Responses API с единым LLM-интерфейсом;
 - stateful-уточнения с PostgreSQL-историей, повторным retrieval и изоляцией диалогов;
+- подтверждаемая пользователем эскалация в службу качества, безопасный SMTP и
+  публикация утверждённых экспертных разъяснений через тот же RAG pipeline;
 - numbered sources, semantic grounding и проверка номеров цитат для обоих провайдеров;
 - traces, timings и token counts в PostgreSQL;
 - деактивация и восстановление документов;
@@ -84,6 +86,12 @@ backend-настройками, использует Responses API с `store=fal
 не более двух уточняющих вопросов и трёх пользовательских ответов. Токен владения
 передаётся только в `X-Conversation-Token`, а в PostgreSQL хранится его SHA-256-хеш:
 [docs/CLIP014_CLARIFICATION_DIALOGUE.md](docs/CLIP014_CLARIFICATION_DIALOGUE.md).
+
+Служба качества создаёт обращение только после явного подтверждения и только для
+защищённого trace с `quality_review_required`/`conflict_detected`. SMTP выключен по
+умолчанию, а экспертные действия требуют отдельного demo-кода. Утверждённый текст
+становится обычным `Document` только после полной индексации:
+[docs/CLIP015_QUALITY_SERVICE.md](docs/CLIP015_QUALITY_SERVICE.md).
 
 Для локальной браузерной демонстрации можно отдельно установить
 `AGENT_DEMO_OVERRIDE_ENABLED=true`. Тогда UI показывает request-level выбор режима;
@@ -216,6 +224,9 @@ Smoke следует запускать на свежих проектных р�
 - `GET /api/v1/admin/traces` — фильтруемый список с `limit`/`offset`;
 - `GET /api/v1/admin/traces/{id}` — ответ, evidence и безопасная проекция trajectory;
 - `POST /api/v1/traces/{id}/feedback` — оценка ответа владельцем trace.
+- `POST /api/v1/quality-requests` — явное обращение владельца диалога;
+- `GET/POST /api/v1/quality-requests...` — обработка, approve и publish с отдельным
+  demo credential службы качества.
 
 `status=ok` означает только техническое завершение. `/api/v1/ask` дополнительно возвращает
 `outcome` и безопасный `reason_code`. Dashboard не выдаёт технический статус за
@@ -247,6 +258,8 @@ registry. Для `/api/chat` приложение отправляет конф�
   но не ACL или production security;
 - административные traces доступны глобально в локальном MVP; фильтры не являются ACL;
 - нет очереди ingestion и автоматической reconciliation между тремя хранилищами;
+- SMTP и публикация экспертного источника синхронны; demo approval token не заменяет
+  корпоративную identity/SSO/ACL;
 - evidence assessment и проверка номера цитаты не заменяют экспертную entailment-проверку;
 - baseline измерен на синтетических документах и не является оценкой качества на
   производственном корпусе;

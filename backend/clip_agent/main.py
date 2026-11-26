@@ -51,6 +51,8 @@ from .db import (
     Conversation,
     ConversationTurn,
     Document,
+    QualityKnowledgeEntry,
+    QualityRequest,
     SearchTrace,
     SessionLocal,
     TraceFeedback,
@@ -70,6 +72,18 @@ from .llm import (
     resolve_llm_selection,
 )
 from .search import index_chunks, opensearch, qdrant, retrieve
+from .quality import (
+    QUALITY_APPROVAL_HEADER,
+    QualityServiceError,
+    approve_draft,
+    create_quality_request,
+    publish_latest,
+    reject_request,
+    require_approval_token,
+    save_draft,
+    send_notification,
+    serialize_request,
+)
 
 settings = get_settings()
 llm_gate = RequestGate(
@@ -126,6 +140,22 @@ class FeedbackRequest(BaseModel):
     rating: Literal["helpful", "incomplete", "incorrect", "missing_documents"]
     user_id: str = Field(min_length=1, max_length=200)
     session_id: str = Field(min_length=1, max_length=200)
+
+
+class QualityRequestCreate(BaseModel):
+    trace_id: UUID
+
+
+class QualityDraftRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    answer: str = Field(min_length=1, max_length=8000)
+    scope: str = Field(min_length=1, max_length=2000)
+    conditions: str = Field(default="", max_length=2000)
+    expert_label: str = Field(min_length=1, max_length=200)
+
+
+class QualityRejectRequest(BaseModel):
+    expert_label: str = Field(min_length=1, max_length=200)
 
 
 @app.get("/healthz")
@@ -286,6 +316,172 @@ def restore(document_id: UUID, db: Session = Depends(get_db)) -> dict:
     document.active = True
     db.commit()
     return serialize_document(document)
+
+
+def _quality_http_error(exc: QualityServiceError) -> HTTPException:
+    return HTTPException(exc.status_code, detail=str(exc))
+
+
+@app.post("/api/v1/quality-requests", status_code=201)
+def create_quality_escalation(
+    payload: QualityRequestCreate,
+    idempotency_key: Annotated[
+        str, Header(alias="Idempotency-Key", min_length=8, max_length=128)
+    ],
+    conversation_token: Annotated[
+        str | None, Header(alias=CONVERSATION_TOKEN_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        request, created = create_quality_request(
+            db,
+            trace_id=payload.trace_id,
+            idempotency_key=idempotency_key,
+            conversation_token=conversation_token,
+            settings=settings,
+        )
+    except QualityServiceError as exc:
+        raise _quality_http_error(exc) from exc
+    result = serialize_request(db, request, detail=True)
+    result["created"] = created
+    return result
+
+
+def _require_quality_role(token: str | None) -> None:
+    try:
+        require_approval_token(token, settings)
+    except QualityServiceError as exc:
+        raise _quality_http_error(exc) from exc
+
+
+@app.get("/api/v1/quality-requests")
+def list_quality_requests(
+    approval_token: Annotated[
+        str | None, Header(alias=QUALITY_APPROVAL_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    _require_quality_role(approval_token)
+    rows = db.scalars(select(QualityRequest).order_by(QualityRequest.created_at.desc())).all()
+    return [serialize_request(db, row) for row in rows]
+
+
+@app.get("/api/v1/quality-requests/{request_id}")
+def quality_request_detail(
+    request_id: UUID,
+    approval_token: Annotated[
+        str | None, Header(alias=QUALITY_APPROVAL_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_quality_role(approval_token)
+    request = db.get(QualityRequest, request_id)
+    if request is None:
+        raise HTTPException(404, "Обращение не найдено.")
+    return serialize_request(db, request, detail=True)
+
+
+@app.post("/api/v1/quality-requests/{request_id}/draft")
+def update_quality_draft(
+    request_id: UUID,
+    payload: QualityDraftRequest,
+    approval_token: Annotated[
+        str | None, Header(alias=QUALITY_APPROVAL_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_quality_role(approval_token)
+    request = db.get(QualityRequest, request_id)
+    if request is None:
+        raise HTTPException(404, "Обращение не найдено.")
+    try:
+        request = save_draft(
+            db,
+            request,
+            title=payload.title.strip(),
+            answer=payload.answer.strip(),
+            scope=payload.scope.strip(),
+            conditions=payload.conditions.strip(),
+            expert_label=payload.expert_label.strip(),
+        )
+    except QualityServiceError as exc:
+        raise _quality_http_error(exc) from exc
+    return serialize_request(db, request, detail=True)
+
+
+@app.post("/api/v1/quality-requests/{request_id}/approve")
+def approve_quality_draft(
+    request_id: UUID,
+    approval_token: Annotated[
+        str | None, Header(alias=QUALITY_APPROVAL_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_quality_role(approval_token)
+    try:
+        request, _entry = approve_draft(db, request_id)
+    except QualityServiceError as exc:
+        raise _quality_http_error(exc) from exc
+    return serialize_request(db, request, detail=True)
+
+
+@app.post("/api/v1/quality-requests/{request_id}/reject")
+def reject_quality_request(
+    request_id: UUID,
+    payload: QualityRejectRequest,
+    approval_token: Annotated[
+        str | None, Header(alias=QUALITY_APPROVAL_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_quality_role(approval_token)
+    request = db.get(QualityRequest, request_id)
+    if request is None:
+        raise HTTPException(404, "Обращение не найдено.")
+    try:
+        request = reject_request(db, request, payload.expert_label.strip())
+    except QualityServiceError as exc:
+        raise _quality_http_error(exc) from exc
+    return serialize_request(db, request, detail=True)
+
+
+@app.post("/api/v1/quality-requests/{request_id}/publish")
+def publish_quality_knowledge(
+    request_id: UUID,
+    approval_token: Annotated[
+        str | None, Header(alias=QUALITY_APPROVAL_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+    _slot: None = Depends(acquire_ingest_slot),
+) -> dict:
+    _require_quality_role(approval_token)
+    try:
+        request, _entry = publish_latest(db, request_id, settings)
+    except QualityServiceError as exc:
+        raise _quality_http_error(exc) from exc
+    return serialize_request(db, request, detail=True)
+
+
+@app.post("/api/v1/quality-requests/{request_id}/retry-email")
+def retry_quality_email(
+    request_id: UUID,
+    approval_token: Annotated[
+        str | None, Header(alias=QUALITY_APPROVAL_HEADER)
+    ] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_quality_role(approval_token)
+    request = db.get(QualityRequest, request_id)
+    if request is None:
+        raise HTTPException(404, "Обращение не найдено.")
+    if request.email_status != "failed":
+        raise HTTPException(
+            409,
+            "Повтор разрешён только после явной ошибки; delivery_unknown не отправляется повторно.",
+        )
+    send_notification(db, request, settings)
+    return serialize_request(db, request, detail=True)
 
 
 @app.post("/api/v1/ask")
@@ -1208,6 +1404,21 @@ def _trace_sources(db: Session, row: SearchTrace) -> list[dict]:
         .where(Chunk.id.in_(source_ids))
     ).all()
     by_id = {chunk.id: (chunk, document) for chunk, document in records}
+    document_ids = {document.id for _, document in records}
+    quality_rows = db.execute(
+        select(QualityKnowledgeEntry, QualityRequest)
+        .join(
+            QualityRequest,
+            QualityKnowledgeEntry.quality_request_id == QualityRequest.id,
+        )
+        .where(
+            QualityKnowledgeEntry.document_id.in_(document_ids),
+            QualityKnowledgeEntry.status == "published",
+        )
+    ).all() if document_ids else []
+    quality_by_document = {
+        entry.document_id: (entry, request) for entry, request in quality_rows
+    }
     return [
         {
             "chunk_id": str(chunk.id),
@@ -1219,6 +1430,20 @@ def _trace_sources(db: Session, row: SearchTrace) -> list[dict]:
             "child_text": chunk.child_text,
             "child_start": chunk.child_start,
             "child_end": chunk.child_end,
+            **(
+                {
+                    "source_type": "quality_clarification",
+                    "quality_request_number": quality_by_document[document.id][1].public_number,
+                    "quality_knowledge_entry_id": str(
+                        quality_by_document[document.id][0].id
+                    ),
+                    "approval_number": quality_by_document[document.id][0].approval_number,
+                    "approved_at": quality_by_document[document.id][0].approved_at.isoformat(),
+                    "scope": quality_by_document[document.id][0].scope,
+                }
+                if document.id in quality_by_document
+                else {"source_type": "corporate_document"}
+            ),
         }
         for source_id in source_ids
         if source_id in by_id
@@ -1247,9 +1472,50 @@ def analytics(
         )
     ).all()
     feedback = _feedback_by_trace(db, [row.id for row in rows])
+    quality_counts = {
+        "quality_requests_created": db.scalar(
+            select(func.count()).select_from(QualityRequest)
+        )
+        or 0,
+        "quality_emails_sent": db.scalar(
+            select(func.count())
+            .select_from(QualityRequest)
+            .where(QualityRequest.email_status == "sent")
+        )
+        or 0,
+        "quality_email_failures": db.scalar(
+            select(func.count())
+            .select_from(QualityRequest)
+            .where(QualityRequest.email_status.in_(["failed", "delivery_unknown"]))
+        )
+        or 0,
+        "quality_requests_pending": db.scalar(
+            select(func.count())
+            .select_from(QualityRequest)
+            .where(QualityRequest.status.in_(["new", "awaiting_expert", "draft"]))
+        )
+        or 0,
+        "quality_knowledge_approved": db.scalar(
+            select(func.count()).select_from(QualityKnowledgeEntry)
+        )
+        or 0,
+        "quality_knowledge_published": db.scalar(
+            select(func.count())
+            .select_from(QualityKnowledgeEntry)
+            .where(QualityKnowledgeEntry.status == "published")
+        )
+        or 0,
+        "quality_requests_rejected": db.scalar(
+            select(func.count())
+            .select_from(QualityRequest)
+            .where(QualityRequest.status == "rejected")
+        )
+        or 0,
+    }
     return {
         "total_documents": total_documents,
         "active_documents": active_documents,
+        **quality_counts,
         **aggregate_traces(rows, feedback),
     }
 

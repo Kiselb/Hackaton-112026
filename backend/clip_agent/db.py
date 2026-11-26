@@ -11,6 +11,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    event,
+    inspect,
 )
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
@@ -120,6 +122,120 @@ class ConversationTurn(Base):
     llm_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     llm_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class QualityRequest(Base):
+    __tablename__ = "quality_requests"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    public_number: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    trace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("search_traces.id"), unique=True, index=True
+    )
+    conversation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("conversations.id"), index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    question: Mapped[str] = mapped_column(Text)
+    reason_code: Mapped[str] = mapped_column(String(100))
+    source_outcome: Mapped[str] = mapped_column(String(64))
+    clarification_context: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="new", index=True)
+    email_status: Mapped[str] = mapped_column(
+        String(32), default="not_requested", index=True
+    )
+    email_error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    draft_title: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    draft_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    draft_scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    draft_conditions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    draft_expert_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    email_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    email_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class QualityKnowledgeEntry(Base):
+    __tablename__ = "quality_knowledge_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "quality_request_id", "version", name="uq_quality_knowledge_request_version"
+        ),
+    )
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    quality_request_id: Mapped[UUID] = mapped_column(
+        ForeignKey("quality_requests.id"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    approval_number: Mapped[str] = mapped_column(String(64), unique=True)
+    original_question: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(String(500))
+    approved_text: Mapped[str] = mapped_column(Text)
+    scope: Mapped[str] = mapped_column(Text)
+    conditions: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="approved", index=True)
+    approval_method: Mapped[str] = mapped_column(String(64))
+    expert_label: Mapped[str] = mapped_column(String(200))
+    checksum: Mapped[str] = mapped_column(String(64))
+    document_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("documents.id"), unique=True, nullable=True, index=True
+    )
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class QualityAuditEvent(Base):
+    __tablename__ = "quality_audit_events"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    quality_request_id: Mapped[UUID] = mapped_column(
+        ForeignKey("quality_requests.id"), index=True
+    )
+    quality_knowledge_entry_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("quality_knowledge_entries.id"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    actor_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    authorization_method: Mapped[str] = mapped_column(String(64))
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+_IMMUTABLE_KNOWLEDGE_FIELDS = {
+    "quality_request_id",
+    "version",
+    "approval_number",
+    "original_question",
+    "title",
+    "approved_text",
+    "scope",
+    "conditions",
+    "approval_method",
+    "expert_label",
+    "checksum",
+    "approved_at",
+}
+
+
+@event.listens_for(QualityKnowledgeEntry, "before_update")
+def prevent_approved_knowledge_rewrite(_mapper, _connection, target) -> None:
+    state = inspect(target)
+    changed = [name for name in _IMMUTABLE_KNOWLEDGE_FIELDS if state.attrs[name].history.has_changes()]
+    if changed:
+        raise ValueError(
+            "Approved quality knowledge is immutable; create a new version instead: "
+            + ", ".join(sorted(changed))
+        )
 
 
 engine = create_engine(get_settings().postgres_dsn, pool_pre_ping=True)
