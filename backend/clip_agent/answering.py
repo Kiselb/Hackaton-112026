@@ -93,14 +93,20 @@ def parse_grounding_validation(value: str) -> tuple[bool, list[str]]:
     if start < 0 or end <= start:
         raise ValueError("grounding validator returned no JSON object")
     parsed = json.loads(cleaned[start : end + 1])
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("valid"), bool):
+    if not isinstance(parsed, dict):
         raise ValueError("grounding validator returned invalid schema")
+    if not isinstance(parsed.get("valid"), bool):
+        raise ValueError("grounding validator field 'valid' must be boolean")
+    for field in ("unsupported_claims", "scope_errors"):
+        items = parsed.get(field)
+        if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+            raise ValueError(f"grounding validator field {field!r} must be list[str]")
     failures = [
-        str(item)
+        item
         for key in ("unsupported_claims", "scope_errors")
-        for item in parsed.get(key, [])
+        for item in parsed[key]
     ]
-    return bool(parsed["valid"]), failures
+    return parsed["valid"] and not failures, failures
 
 
 def citation_ids_admissible(answer: str, source_count: int) -> bool:

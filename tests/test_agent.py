@@ -118,7 +118,10 @@ class ScriptedLlm:
                 }
             ), usage
         if "Validate whether" in prompt:
-            return '{"valid":true,"unsupported_claims":[]}', usage
+            return (
+                '{"valid":true,"unsupported_claims":[],"scope_errors":[]}',
+                usage,
+            )
         if "Черновик:" in prompt:
             return "Исправленный ответ [1].", usage
         return self.draft, usage
@@ -345,6 +348,35 @@ def test_invalid_validator_json_fails_closed():
     assert "grounding_validator_invalid_json" in state["validation"]["llm_failures"]
 
 
+def test_inconsistent_validator_result_does_not_publish_agent_draft():
+    class InconsistentValidator(ScriptedLlm):
+        def __call__(self, prompt: str):
+            if "Validate whether" in prompt:
+                self.calls.append(prompt)
+                return json.dumps(
+                    {
+                        "valid": True,
+                        "unsupported_claims": ["draft contains an unsupported conclusion"],
+                        "scope_errors": [],
+                    }
+                ), {"prompt_eval_count": 2, "eval_count": 1}
+            return super().__call__(prompt)
+
+    draft = "Неподтверждённый корпоративный вывод [1]."
+    state = agent(Retriever(), InconsistentValidator(draft=draft)).invoke(
+        "Какой лимит установлен?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "quality_review_required"
+    assert state["status"] == "abstained"
+    assert state["answer"] != draft
+    assert "Неподтверждённый корпоративный вывод" not in state["answer"]
+    assert state["validation"]["valid"] is False
+    assert state["validation"]["llm_failures"] == [
+        "draft contains an unsupported conclusion"
+    ]
+
+
 def test_unsupported_scope_conclusion_is_not_published():
     class RejectingValidator(ScriptedLlm):
         def __call__(self, prompt: str):
@@ -366,6 +398,64 @@ def test_unsupported_scope_conclusion_is_not_published():
     assert state["outcome"] == "quality_review_required"
     assert "другого подразделения" not in state["answer"]
     assert state["refusal_reason"] == "answer_validation_failed"
+
+
+def test_grounding_validator_error_never_starts_baseline_fallback(monkeypatch):
+    from clip_agent import main
+
+    class FakeDb:
+        def __init__(self):
+            self.trace = None
+
+        def add(self, value):
+            self.trace = value
+            if value.id is None:
+                value.id = uuid4()
+
+        def commit(self):
+            pass
+
+    def validator_error(*args, **kwargs):
+        return {
+            "answer": (
+                "Не удалось завершить автоматическую проверку ответа по источникам. "
+                "Неподтверждённый ответ не опубликован."
+            ),
+            "sources": [],
+            "retrieval": trace(),
+            "retrieved_count": 1,
+            "usage": {"prompt_eval_count": 10, "eval_count": 2},
+            "trace_details": {
+                "mode": "langgraph_agent",
+                "outcome": "technical_error",
+                "reason_code": "grounding_validator_invalid_json",
+                "validation": {
+                    "valid": False,
+                    "citations_valid": True,
+                    "llm_failures": ["grounding_validator_invalid_json"],
+                },
+                "search_calls": 1,
+                "llm_calls": 3,
+                "step_count": 6,
+                "retries": 0,
+            },
+        }
+
+    monkeypatch.setattr(main.settings, "agent_enabled", True)
+    monkeypatch.setattr(main, "run_agent", validator_error)
+    monkeypatch.setattr(
+        main,
+        "retrieve",
+        lambda question: (_ for _ in ()).throw(AssertionError("baseline fallback ran")),
+    )
+
+    result = main.ask(
+        main.AskRequest(question="Какой лимит?", user_id="u", session_id="s"), FakeDb()
+    )
+
+    assert result["outcome"] == "technical_error"
+    assert result["reason_code"] == "grounding_validator_invalid_json"
+    assert result["metrics"]["agent_enabled"] is True
 
 
 def test_real_source_ambiguity_returns_specific_clarification():

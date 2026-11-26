@@ -114,6 +114,31 @@ def test_baseline_unsupported_conclusion_is_replaced_with_safe_outcome(monkeypat
     assert result["reason_code"] == "answer_validation_failed"
 
 
+def test_baseline_inconsistent_validator_result_does_not_publish_draft(monkeypatch):
+    monkeypatch.setattr(main.settings, "agent_enabled", False)
+    monkeypatch.setattr(main, "retrieve", lambda question: ([evidence()], 1, retrieval_trace()))
+    draft = "Лимит применяется всем подразделениям [1]."
+    responses = iter(
+        [
+            Response(draft),
+            Response(
+                '{"valid":true,"unsupported_claims":["unsupported scope"],'
+                '"scope_errors":[]}'
+            ),
+        ]
+    )
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: next(responses))
+    db = FakeDb()
+
+    result = main.ask(main.AskRequest(question="Кому применяется лимит?"), db)
+
+    assert result["outcome"] == "quality_review_required"
+    assert result["reason_code"] == "answer_validation_failed"
+    assert result["answer"] != draft
+    assert "применяется всем подразделениям" not in result["answer"]
+    assert db.trace.details["validation_failures"] == ["unsupported scope"]
+
+
 def test_baseline_invalid_validator_json_is_a_technical_error(monkeypatch):
     monkeypatch.setattr(main.settings, "agent_enabled", False)
     monkeypatch.setattr(main, "retrieve", lambda question: ([evidence()], 1, retrieval_trace()))

@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from clip_agent.answering import (
     build_answer_prompt,
     build_citation_repair_prompt,
@@ -70,14 +74,69 @@ def test_temporal_gate_abstains_only_without_effective_period_evidence():
     assert "для всех сделок [1][2]" in answer
 
 
-def test_grounding_validator_requires_boolean_schema_and_reports_scope_errors():
+def test_grounding_validator_accepts_valid_result_with_empty_violation_lists():
     prompt = build_grounding_validation_prompt(
         "Кому применяется правило?", "Правило применяется всем [1].", sources()
     )
     assert "valid citation number alone is insufficient" in prompt
     assert "scope (department, process, stage and conditions)" in prompt
     valid, failures = parse_grounding_validation(
-        '{"valid":false,"unsupported_claims":[],"scope_errors":["wrong department"]}'
+        '{"valid":true,"unsupported_claims":[],"scope_errors":[]}'
+    )
+    assert valid is True
+    assert failures == []
+
+
+def test_grounding_validator_rejects_declared_invalid_result_with_violations():
+    valid, failures = parse_grounding_validation(
+        '{"valid":false,"unsupported_claims":["unsupported fact"],'
+        '"scope_errors":["wrong department"]}'
     )
     assert valid is False
-    assert failures == ["wrong department"]
+    assert failures == ["unsupported fact", "wrong department"]
+
+
+@pytest.mark.parametrize(
+    ("field", "violation"),
+    [
+        ("unsupported_claims", "unsupported fact"),
+        ("scope_errors", "wrong department"),
+    ],
+)
+def test_grounding_validator_rejects_inconsistent_valid_result(
+    field: str, violation: str
+):
+    payload = {
+        "valid": True,
+        "unsupported_claims": [],
+        "scope_errors": [],
+    }
+    payload[field] = [violation]
+
+    valid, failures = parse_grounding_validation(json.dumps(payload))
+
+    assert valid is False
+    assert failures == [violation]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"valid":"true","unsupported_claims":[],"scope_errors":[]}',
+        '{"valid":true,"unsupported_claims":"none","scope_errors":[]}',
+        '{"valid":true,"unsupported_claims":[],"scope_errors":{}}',
+        '{"valid":true,"unsupported_claims":[1],"scope_errors":[]}',
+        '{"valid":true,"unsupported_claims":[],"scope_errors":[null]}',
+        '{"valid":true,"unsupported_claims":[]}',
+        '{"unsupported_claims":[],"scope_errors":[]}',
+    ],
+)
+def test_grounding_validator_rejects_invalid_field_types(payload: str):
+    with pytest.raises(ValueError, match="grounding validator"):
+        parse_grounding_validation(payload)
+
+
+@pytest.mark.parametrize("payload", ["not-json", "{broken", "[]"])
+def test_grounding_validator_rejects_malformed_or_non_object_json(payload: str):
+    with pytest.raises((ValueError, TypeError)):
+        parse_grounding_validation(payload)
