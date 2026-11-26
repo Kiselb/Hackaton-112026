@@ -120,6 +120,41 @@ def test_aggregate_handles_empty_history_and_nearest_rank_p95():
     assert summary["output_tokens"] == 12
     assert summary["modes"]["baseline"] == 2
     assert summary["modes"]["agent"] == 1
+    assert summary["multi_query"]["not_requested"] == 1
+
+
+def test_multi_query_analytics_group_by_effective_mode_not_requested_label():
+    rows = [
+        make_trace(
+            details={
+                "mode": "langgraph_agent",
+                "outcome": "answered",
+                "multi_query_requested": True,
+                "multi_query_effective": True,
+                "multi_query_status": "applied",
+                "search_calls": 2,
+                "retrieved_unique_chunks": 3,
+            }
+        ),
+        make_trace(
+            details={
+                "mode": "langgraph_agent",
+                "outcome": "quality_review_required",
+                "multi_query_requested": True,
+                "multi_query_effective": False,
+                "multi_query_status": "expansion_unavailable",
+                "search_calls": 1,
+            }
+        ),
+    ]
+
+    result = aggregate_traces(rows)["multi_query"]
+
+    assert result["requested"] == 2
+    assert result["successful_expansions"] == 1
+    assert result["fallbacks"] == 1
+    assert result["groups"]["on"]["average_retrieval_calls"] == 2
+    assert result["groups"]["off"]["quality_review_required_share"] == 1
 
 
 def test_trace_list_filters_categories_and_paginates(db: Session):

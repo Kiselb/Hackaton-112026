@@ -48,6 +48,18 @@ PLANNER_SCHEMA = {
     "additionalProperties": False,
 }
 
+MULTI_QUERY_PLANNER_SCHEMA = {
+    **PLANNER_SCHEMA,
+    "properties": {
+        **PLANNER_SCHEMA["properties"],
+        "search_queries": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {"type": "string", "maxLength": 500},
+        },
+    },
+}
+
 class AgentState(TypedDict, total=False):
     request_id: str
     question: str
@@ -77,6 +89,17 @@ class AgentState(TypedDict, total=False):
     conflicts: list[dict[str, Any]]
     validation: dict[str, Any]
     errors: list[dict[str, str]]
+    multi_query_requested: bool
+    multi_query_effective: bool
+    multi_query_status: str
+    multi_query_fallback_reason: str | None
+    multi_query_generated_count: int
+    multi_query_executed_count: int
+    multi_query_search_calls: int
+    multi_query_unique_sources: int
+    multi_query_deduplicated_count: int
+    multi_query_latency_ms: float
+    multi_query_queries: list[str]
 
 
 @dataclass(frozen=True)
@@ -150,6 +173,122 @@ def _dedupe_evidence(
         if len(result) >= limit:
             break
     return result
+
+
+def _query_words(value: str) -> set[str]:
+    return {
+        word
+        for word in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", value.casefold())
+        if len(word) > 1
+    }
+
+
+def _queries_similar(left: str, right: str) -> bool:
+    left_words, right_words = _query_words(left), _query_words(right)
+    if not left_words or not right_words:
+        return left.strip().casefold() == right.strip().casefold()
+    overlap = len(left_words & right_words) / len(left_words | right_words)
+    return overlap >= 0.9
+
+
+def _preserves_query_constraints(original: str, candidate: str) -> bool:
+    """Reject obvious scope drift; semantic correctness is still checked by the prompt."""
+    original_acronyms = set(re.findall(r"\b[А-ЯЁA-Z]{2,}\b", original))
+    candidate_acronyms = set(re.findall(r"\b[А-ЯЁA-Z]{2,}\b", candidate))
+    if not original_acronyms.issubset(candidate_acronyms):
+        return False
+    original_numbers = set(re.findall(r"\b\d[\d./:-]*\b", original))
+    candidate_numbers = set(re.findall(r"\b\d[\d./:-]*\b", candidate))
+    if candidate_numbers != original_numbers:
+        return False
+    original_quotes = {
+        value.casefold().strip()
+        for value in re.findall(r"[«\"]([^»\"]+)[»\"]", original)
+    }
+    if any(value not in candidate.casefold() for value in original_quotes):
+        return False
+    scope_stems = {
+        "дирекц",
+        "департамент",
+        "отдел",
+        "филиал",
+        "пресейл",
+        "реализац",
+        "внедрен",
+        "эксплуатац",
+        "сопровожден",
+        "разработ",
+        "закуп",
+    }
+
+    def scope_markers(value: str) -> set[str]:
+        return {
+            stem
+            for stem in scope_stems
+            if any(word.startswith(stem) for word in _query_words(value))
+        }
+
+    return scope_markers(candidate) == scope_markers(original)
+
+
+def _safe_query_variants(
+    original: str, candidates: list[Any], max_variants: int
+) -> list[str]:
+    result = [original]
+    for raw in candidates:
+        candidate = re.sub(r"\s+", " ", str(raw)).strip()
+        if (
+            not candidate
+            or len(candidate) > 500
+            or not _preserves_query_constraints(original, candidate)
+            or any(_queries_similar(candidate, existing) for existing in result)
+        ):
+            continue
+        result.append(candidate)
+        if len(result) >= max_variants:
+            break
+    return result
+
+
+def _fuse_query_results(
+    ranked_results: list[tuple[str, list[dict[str, Any]]]], limit: int = 8
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Fuse per-query, already-ranked results without mixing raw backend scores."""
+    scores: dict[str, float] = {}
+    best: dict[str, dict[str, Any]] = {}
+    contributions: dict[str, list[dict[str, Any]]] = {}
+    raw_count = 0
+    for query, sources in ranked_results:
+        raw_count += len(sources)
+        seen_in_query: set[str] = set()
+        for rank, source in enumerate(sources, start=1):
+            chunk_id = str(source.get("chunk_id") or "")
+            if not chunk_id or chunk_id in seen_in_query:
+                continue
+            seen_in_query.add(chunk_id)
+            contribution = 1.0 / (60 + rank)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + contribution
+            best.setdefault(chunk_id, dict(source))
+            contributions.setdefault(chunk_id, []).append(
+                {
+                    "query": query,
+                    "rank": rank,
+                    "rrf_contribution": round(contribution, 8),
+                }
+            )
+    ordered_ids = sorted(scores, key=lambda item: (-scores[item], item))
+    fused: list[dict[str, Any]] = []
+    for rank, chunk_id in enumerate(ordered_ids[:limit], start=1):
+        prepared = best[chunk_id]
+        _, security_flags = sanitize_document_text(str(prepared.get("parent_text", "")))
+        if security_flags:
+            prepared["document_security_flags"] = security_flags
+        prepared["multi_query_rrf_score"] = round(scores[chunk_id], 8)
+        prepared["multi_query_rank"] = rank
+        prepared["query_contributions"] = contributions[chunk_id]
+        fused.append(prepared)
+    unique_count = len(scores)
+    return fused, unique_count, max(0, raw_count - unique_count)
 
 
 def _unsupported_guard(question: str, answer: str) -> list[str]:
@@ -230,10 +369,12 @@ class BoundedAgent:
         limits: AgentLimits,
         retriever: Retriever = retrieve,
         llm: LlmCaller = call_ollama,
+        multi_query_max_variants: int = 2,
     ) -> None:
         self.limits = limits
         self.retriever = retriever
         self.llm = llm
+        self.multi_query_max_variants = multi_query_max_variants
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -322,24 +463,59 @@ class BoundedAgent:
     def route_and_plan(self, state: AgentState) -> dict[str, Any]:
         started = time.perf_counter()
         question = state["question"]
-        if not _is_complex(question):
+        multi_query_requested = state.get("multi_query_requested", False)
+        expansion_budget_available = (
+            state.get("llm_calls", 0) + 4 <= self.limits.max_llm_calls
+        )
+        if not _is_complex(question) and not (
+            multi_query_requested and expansion_budget_available
+        ):
             plan = [{"aspect_id": "aspect-1", "question": question}]
             update = self._record(state, "route_and_plan", started, "fast_route")
+            status = (
+                "skipped_llm_budget"
+                if multi_query_requested and not expansion_budget_available
+                else "disabled"
+            )
             return {
                 **update,
                 "plan": plan,
                 "search_queries": [question],
+                "multi_query_status": status,
+                "multi_query_fallback_reason": (
+                    "grounding_validation_budget_reserved"
+                    if status == "skipped_llm_budget"
+                    else None
+                ),
+                "multi_query_latency_ms": round(
+                    (time.perf_counter() - started) * 1000, 3
+                ) if multi_query_requested else 0.0,
                 "next_action": "retrieve",
             }
+        expansion_requested = multi_query_requested and expansion_budget_available
         prompt = (
             "Return JSON only. Decompose the corporate-document question into at most three "
-            "independent evidence aspects and at most two focused search queries. Preserve the "
-            "original question. Schema: "
+            "independent evidence aspects. "
+            + (
+                "Also produce semantically distinct search formulations, including no more than "
+                f"{self.multi_query_max_variants - 1} alternatives. Preserve every explicit "
+                "department, process, stage, date, quoted term, acronym, and user constraint. "
+                "Do not invent corporate facts, duties, deadlines, departments, or conflicting "
+                "conditions. Query expansion is only a retrieval aid, never evidence. "
+                if expansion_requested
+                else "Produce at most two focused search queries for the existing bounded planner. "
+            )
+            + "Preserve the original question. Schema: "
             '{"aspects":[{"aspect_id":"aspect-1","question":"..."}],'
             '"search_queries":["..."]}. Question: ' + question
         )
         content, usage, error = self._call(
-            state, prompt, json_schema=PLANNER_SCHEMA, schema_name="agent_plan"
+            state,
+            prompt,
+            json_schema=(
+                MULTI_QUERY_PLANNER_SCHEMA if expansion_requested else PLANNER_SCHEMA
+            ),
+            schema_name="agent_plan",
         )
         llm_calls = state.get("llm_calls", 0) + int(
             error is None or error.get("attempted", True)
@@ -366,16 +542,43 @@ class BoundedAgent:
                     plan.append({"aspect_id": aspect_id, "question": aspect_question})
             if not plan:
                 raise ValueError("planner returned no valid aspects")
-            queries = [question]
+            raw_candidates: list[Any] = []
             if isinstance(raw_queries, list):
-                queries.extend(str(item).strip() for item in raw_queries if str(item).strip())
-            queries = list(dict.fromkeys(queries))[:2]
-            decision = "planned"
+                raw_candidates = raw_queries
+            if expansion_requested:
+                queries = _safe_query_variants(
+                    question, raw_candidates, self.multi_query_max_variants
+                )
+            else:
+                queries = [question]
+                queries.extend(
+                    str(item).strip() for item in raw_candidates if str(item).strip()
+                )
+                queries = list(dict.fromkeys(queries))[:2]
+            decision = "planned_with_multi_query" if expansion_requested else "planned"
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             plan = [{"aspect_id": "aspect-1", "question": question}]
             queries = [question]
             decision = "planner_fallback"
             errors.append({"node": "route_and_plan", "error": str(exc)})
+        generated_count = max(0, len(queries) - 1) if expansion_requested else 0
+        multi_query_status = "disabled"
+        fallback_reason = None
+        if multi_query_requested:
+            if not expansion_budget_available:
+                multi_query_status = "skipped_llm_budget"
+                fallback_reason = "grounding_validation_budget_reserved"
+            elif generated_count:
+                multi_query_status = "expanded"
+            else:
+                multi_query_status = "expansion_unavailable"
+                fallback_reason = (
+                    str(error.get("category"))
+                    if error and error.get("category")
+                    else "planner_invalid_or_unavailable"
+                    if decision == "planner_fallback"
+                    else "no_distinct_safe_variants"
+                )
         update = self._record(
             state,
             "route_and_plan",
@@ -392,27 +595,57 @@ class BoundedAgent:
             "llm_calls": llm_calls,
             "plan": plan,
             "search_queries": queries,
+            "multi_query_status": multi_query_status,
+            "multi_query_fallback_reason": fallback_reason,
+            "multi_query_generated_count": generated_count,
+            "multi_query_latency_ms": round(
+                (time.perf_counter() - started) * 1000, 3
+            ) if multi_query_requested else 0.0,
             "errors": errors,
             "next_action": "retrieve",
         }
 
-    def _execute_searches(self, state: AgentState, queries: list[str]) -> dict[str, Any]:
+    def _execute_searches(
+        self,
+        state: AgentState,
+        queries: list[str],
+        *,
+        fuse_queries: bool = False,
+        phase: str = "targeted",
+    ) -> dict[str, Any]:
         evidence = list(state.get("evidence", []))
         retrieval_runs = list(state.get("retrieval_runs", []))
         searched = list(state.get("searched_queries", []))
         search_calls = state.get("search_calls", 0)
+        ranked_results: list[tuple[str, list[dict[str, Any]]]] = []
+        errors = list(state.get("errors", []))
+        executed = 0
         for query in queries:
             if search_calls >= self.limits.max_search_calls:
                 break
             if query in searched:
                 continue
-            sources, retrieved_count, retrieval_trace = self.retriever(query, None)
             search_calls += 1
             searched.append(query)
-            evidence = _dedupe_evidence(evidence, sources)
+            executed += 1
+            try:
+                sources, retrieved_count, retrieval_trace = self.retriever(query, None)
+            except Exception as exc:
+                sources, retrieved_count = [], 0
+                retrieval_trace = {
+                    "enabled": False,
+                    "status": "error",
+                    "latency_ms": 0.0,
+                    "fallback_reason": "retrieval_error",
+                }
+                errors.append({"node": "retrieve", "error": str(exc)})
+            ranked_results.append((query, sources))
+            if not fuse_queries:
+                evidence = _dedupe_evidence(evidence, sources)
             retrieval_runs.append(
                 {
                     "query": query,
+                    "phase": phase,
                     "retrieved_count": retrieved_count,
                     "selected_source_ids": [
                         source.get("chunk_id") for source in sources
@@ -420,11 +653,25 @@ class BoundedAgent:
                     "retrieval": retrieval_trace,
                 }
             )
+        unique_sources = len({
+            str(source.get("chunk_id"))
+            for _, sources in ranked_results
+            for source in sources
+            if source.get("chunk_id")
+        })
+        deduplicated_count = 0
+        if fuse_queries and ranked_results:
+            fused, unique_sources, deduplicated_count = _fuse_query_results(ranked_results)
+            evidence = _dedupe_evidence(evidence, fused)
         return {
             "evidence": evidence,
             "retrieval_runs": retrieval_runs,
             "searched_queries": searched,
             "search_calls": search_calls,
+            "errors": errors,
+            "executed_searches": executed,
+            "unique_sources": unique_sources,
+            "deduplicated_count": deduplicated_count,
         }
 
     def retrieve_node(self, state: AgentState) -> dict[str, Any]:
@@ -433,7 +680,29 @@ class BoundedAgent:
         reserve = 1 if self.limits.max_retries > 0 else 0
         initial_cap = max(1, available - reserve)
         queries = state.get("search_queries", [state["question"]])[:initial_cap]
-        result = self._execute_searches(state, queries)
+        requested = state.get("multi_query_requested", False)
+        expansion_active = requested and state.get("multi_query_status") == "expanded"
+        result = self._execute_searches(
+            state,
+            queries,
+            fuse_queries=expansion_active and len(queries) > 1,
+            phase="initial_multi_query" if expansion_active else "initial",
+        )
+        effective = expansion_active and result["executed_searches"] > 1
+        status = state.get("multi_query_status", "disabled")
+        fallback_reason = state.get("multi_query_fallback_reason")
+        retrieval_errors = [
+            run for run in result["retrieval_runs"]
+            if run.get("phase") == "initial_multi_query"
+            and run.get("retrieval", {}).get("status") == "error"
+        ]
+        if effective:
+            status = "partial_retrieval" if retrieval_errors else "applied"
+            if retrieval_errors:
+                fallback_reason = "one_or_more_retrievals_failed"
+        elif requested and status == "expanded":
+            status = "expansion_unavailable"
+            fallback_reason = "alternative_not_executed"
         update = self._record(
             state,
             "retrieve",
@@ -443,7 +712,37 @@ class BoundedAgent:
             search_calls=result["search_calls"],
             evidence_count=len(result["evidence"]),
         )
-        return {**result, **update}
+        return {
+            **result,
+            **update,
+            "multi_query_effective": effective,
+            "multi_query_status": status,
+            "multi_query_fallback_reason": fallback_reason,
+            "multi_query_executed_count": (
+                result["executed_searches"]
+                if expansion_active
+                else int(requested and bool(result["executed_searches"]))
+            ),
+            "multi_query_search_calls": (
+                result["executed_searches"]
+                if expansion_active
+                else int(requested and bool(result["executed_searches"]))
+            ),
+            "multi_query_unique_sources": (
+                result["unique_sources"] if expansion_active else 0
+            ),
+            "multi_query_deduplicated_count": (
+                result["deduplicated_count"] if requested else 0
+            ),
+            "multi_query_latency_ms": round(
+                state.get("multi_query_latency_ms", 0.0)
+                + (time.perf_counter() - started) * 1000,
+                3,
+            ) if requested else 0.0,
+            "multi_query_queries": (
+                queries if expansion_active else ([state["question"]] if requested else [])
+            ),
+        }
 
 
     def _assessment_prompt(self, state: AgentState) -> str:
@@ -912,7 +1211,13 @@ class BoundedAgent:
         return {**update, "status": status, "next_action": "finished"}
 
     def invoke(
-        self, question: str, user_id: str, session_id: str, request_id: str
+        self,
+        question: str,
+        user_id: str,
+        session_id: str,
+        request_id: str,
+        *,
+        multi_query_enabled: bool = False,
     ) -> AgentState:
         initial: AgentState = {
             "request_id": request_id,
@@ -942,6 +1247,17 @@ class BoundedAgent:
             "conflicts": [],
             "validation": {},
             "errors": [],
+            "multi_query_requested": multi_query_enabled,
+            "multi_query_effective": False,
+            "multi_query_status": "requested" if multi_query_enabled else "disabled",
+            "multi_query_fallback_reason": None,
+            "multi_query_generated_count": 0,
+            "multi_query_executed_count": 0,
+            "multi_query_search_calls": 0,
+            "multi_query_unique_sources": 0,
+            "multi_query_deduplicated_count": 0,
+            "multi_query_latency_ms": 0.0,
+            "multi_query_queries": [],
         }
         return self.graph.invoke(initial, {"recursion_limit": 20})
 
@@ -960,6 +1276,7 @@ def agent_from_settings(
             max_llm_calls=configured.agent_max_llm_calls,
         ),
         llm=llm,
+        multi_query_max_variants=configured.multi_query_max_variants,
     )
 
 
@@ -971,13 +1288,20 @@ def run_agent(
     *,
     agent: BoundedAgent | None = None,
     llm: LlmCaller | LlmSession | None = None,
+    multi_query_enabled: bool = False,
 ) -> dict[str, Any]:
     if agent is None and llm is None:
         configured = get_settings()
         selection = resolve_llm_selection(None, None, settings=configured)
         llm = create_llm_session(selection, settings=configured)
     runtime = agent or agent_from_settings(llm=llm)
-    state = runtime.invoke(question, user_id, session_id, request_id)
+    state = runtime.invoke(
+        question,
+        user_id,
+        session_id,
+        request_id,
+        multi_query_enabled=multi_query_enabled,
+    )
     retrieval_runs = state.get("retrieval_runs", [])
     rerank_latencies = [
         float(run.get("retrieval", {}).get("latency_ms") or 0) for run in retrieval_runs
@@ -1001,13 +1325,21 @@ def run_agent(
         {key: value for key, value in source.items() if not key.startswith("_")}
         for source in evidence
     ]
+    retrieved_source_ids = {
+        str(source_id)
+        for run in retrieval_runs
+        for source_id in run.get("selected_source_ids", [])
+        if source_id
+    }
+    raw_retrieved_count = sum(
+        int(run.get("retrieved_count") or 0) for run in retrieval_runs
+    )
+    multi_query_queries = state.get("multi_query_queries", [])
     return {
         "answer": state.get("answer", ""),
         "sources": public_evidence,
         "retrieval": retrieval_trace,
-        "retrieved_count": sum(
-            int(run.get("retrieved_count") or 0) for run in retrieval_runs
-        ),
+        "retrieved_count": len(retrieved_source_ids),
         "usage": {
             "prompt_eval_count": state.get("prompt_tokens", 0),
             "eval_count": state.get("completion_tokens", 0),
@@ -1044,6 +1376,29 @@ def run_agent(
                 "max_llm_calls": runtime.limits.max_llm_calls,
             },
             "retrieval": retrieval_trace,
+            "retrieved_chunks_total": raw_retrieved_count,
+            "retrieved_unique_chunks": len(retrieved_source_ids),
+            "multi_query_requested": state.get("multi_query_requested", False),
+            "multi_query_effective": state.get("multi_query_effective", False),
+            "multi_query_status": state.get("multi_query_status", "disabled"),
+            "multi_query_queries": multi_query_queries,
+            "multi_query_generated_count": state.get(
+                "multi_query_generated_count", 0
+            ),
+            "multi_query_executed_count": state.get(
+                "multi_query_executed_count", 0
+            ),
+            "multi_query_search_calls": state.get("multi_query_search_calls", 0),
+            "multi_query_unique_sources": state.get(
+                "multi_query_unique_sources", 0
+            ),
+            "multi_query_deduplicated_count": state.get(
+                "multi_query_deduplicated_count", 0
+            ),
+            "multi_query_latency_ms": state.get("multi_query_latency_ms", 0.0),
+            "multi_query_fallback_reason": state.get(
+                "multi_query_fallback_reason"
+            ),
             **(llm.summary() if isinstance(llm, LlmSession) else {}),
         },
     }

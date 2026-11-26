@@ -59,8 +59,10 @@ question + user_id + session_id
     -> deterministic input guard (language, meaningfulness, scope, injection)
     -> AGENT_ENABLED=false: strict single-query RAG
     -> AGENT_ENABLED=true (default for new configs): LangGraph
-         route_and_plan (simple fast route or bounded JSON plan)
-         -> retrieve (existing BGE-M3 + BM25 + RRF + SQL visibility + optional rerank)
+         route_and_plan (simple fast route or one bounded JSON plan)
+              -> optional request-level Multi-Query expansion in the same structured call
+         -> retrieve per formulation (existing BGE-M3 + BM25 + RRF + SQL visibility + optional rerank)
+              -> inter-query RRF + chunk_id deduplication when Multi-Query is effective
          -> assess_evidence per aspect
               -> (gap and budget available) targeted_retrieve -> assess_evidence
               -> compose_answer
@@ -115,6 +117,20 @@ the original question remains first. Assessment records aspect-to-source coverag
 Planner errors preserve the original question; assessor/validator JSON errors fail closed.
 The assessment is not an independent source of facts and remains imperfect.
 
+Multi-Query is a separate request-level retrieval strategy, not a second agent. With the
+flag off, the CLIP-015 planner keeps its previous behavior, including bounded additional
+queries for complex questions and targeted retry. With the flag on, the same structured
+`route_and_plan` call may expand even a simple question. The original/resolved question is
+always first; explicit acronyms, quoted terms, numbers and organizational scope are checked
+before a variant is accepted. Per-query results have already passed the PostgreSQL
+`active=true,status=ready` gate. Their ranked lists are fused with RRF, deduplicated by
+`chunk_id` and retain query/rank contributions. Raw BM25 and cosine values are never added.
+
+At defaults, two initial formulations use two of three search calls and reserve one call
+for targeted retry. Expansion requires enough remaining LLM budget for planning,
+assessment, composition and mandatory grounding validation; otherwise it is skipped with
+an explicit trace reason. Provider failures never trigger model/provider fallback.
+
 Agent limits are enforced before calls: at most three search calls, one retry and four
 LLM calls by default. The only graph loop is
 `assess_evidence -> targeted_retrieve -> assess_evidence`; retry/search budgets and
@@ -135,6 +151,11 @@ overlapping categories (`technical_error`, `no_evidence`, `evidence_gap`,
 details. This classification is deterministic and does not claim semantic correctness;
 without a verified signal answer correctness is `not_measured` and a normal answer's
 quality status is `unknown`.
+
+Multi-Query trace fields separate requested/effective status, accepted and executed query
+counts, total search calls, raw versus unique chunks, deduplicated occurrences, latency and
+fallback reason. Analytics group agent turns by the actually effective mode; `answered`
+share is an operational outcome, not accuracy.
 
 `trace_feedback` stores a rating, trace ID and the trace's user/session identity. The API
 requires both identities to match before insertion. Feedback is analysis material only and

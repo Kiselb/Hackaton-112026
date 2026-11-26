@@ -134,6 +134,7 @@ class AskRequest(BaseModel):
     llm_provider: Literal["ollama", "openai"] | None = None
     llm_model: str | None = Field(default=None, min_length=1, max_length=200)
     conversation_id: UUID | None = None
+    multi_query_enabled: bool | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -169,6 +170,11 @@ def capabilities() -> dict:
         "default_mode": "agent" if settings.agent_enabled else "baseline",
         "agent_demo_override_enabled": settings.agent_demo_override_enabled,
         "llm": llm_capabilities(settings),
+        "multi_query": {
+            "available": settings.multi_query_enabled,
+            "default_enabled": settings.multi_query_default_enabled,
+            "max_variants": settings.multi_query_max_variants,
+        },
     }
 
 
@@ -506,6 +512,28 @@ def ask(
     use_agent = settings.agent_enabled
     if payload.mode is not None:
         use_agent = payload.mode == "agent"
+    if payload.multi_query_enabled is True and not settings.multi_query_enabled:
+        raise HTTPException(409, "Multi-Query отключён конфигурацией сервера.")
+    if payload.multi_query_enabled is True and not use_agent:
+        raise HTTPException(409, "Multi-Query доступен только в режиме AI-Агента.")
+    multi_query_requested = use_agent and settings.multi_query_enabled and (
+        payload.multi_query_enabled
+        if payload.multi_query_enabled is not None
+        else settings.multi_query_default_enabled
+    )
+    multi_query_trace_defaults = {
+        "multi_query_requested": multi_query_requested,
+        "multi_query_effective": False,
+        "multi_query_status": "not_run" if multi_query_requested else "disabled",
+        "multi_query_queries": [],
+        "multi_query_generated_count": 0,
+        "multi_query_executed_count": 0,
+        "multi_query_search_calls": 0,
+        "multi_query_unique_sources": 0,
+        "multi_query_deduplicated_count": 0,
+        "multi_query_latency_ms": 0.0,
+        "multi_query_fallback_reason": None,
+    }
     if payload.conversation_id is not None and not use_agent:
         raise HTTPException(
             409,
@@ -567,7 +595,7 @@ def ask(
             reason_code=input_assessment.reason_code or "invalid_input",
             answer=input_assessment.message or "Запрос не может быть обработан.",
             agent_enabled=use_agent,
-            details={"input_guard": "rejected"},
+            details={**multi_query_trace_defaults, "input_guard": "rejected"},
             llm=llm,
         )
 
@@ -619,9 +647,10 @@ def ask(
                 conversation.updated_at = utcnow()
         db.commit()
 
-    conversation_details = _conversation_trace_details(
-        conversation, user_turn, effective_question
-    )
+    conversation_details = {
+        **_conversation_trace_details(conversation, user_turn, effective_question),
+        **multi_query_trace_defaults,
+    }
     if clarification_assessment and not clarification_assessment.allowed:
         result = _finish_controlled(
             db,
@@ -710,6 +739,7 @@ def ask(
                 payload.session_id,
                 str(trace.id),
                 llm=llm,
+                multi_query_enabled=multi_query_requested,
             )
         except Exception as exc:
             controlled = _finish_controlled(
@@ -805,6 +835,31 @@ def ask(
                 "llm_model": selection.model,
                 "provider_latency_ms": llm.summary()["provider_latency_ms"],
                 "provider_error_category": llm.last_error_category,
+                "multi_query_requested": details.get("multi_query_requested", False),
+                "multi_query_effective": details.get("multi_query_effective", False),
+                "multi_query_status": details.get("multi_query_status", "disabled"),
+                "multi_query_queries": details.get("multi_query_queries", []),
+                "multi_query_generated_count": details.get(
+                    "multi_query_generated_count", 0
+                ),
+                "multi_query_executed_count": details.get(
+                    "multi_query_executed_count", 0
+                ),
+                "multi_query_search_calls": details.get(
+                    "multi_query_search_calls", 0
+                ),
+                "multi_query_unique_sources": details.get(
+                    "multi_query_unique_sources", 0
+                ),
+                "multi_query_deduplicated_count": details.get(
+                    "multi_query_deduplicated_count", 0
+                ),
+                "multi_query_latency_ms": details.get(
+                    "multi_query_latency_ms", 0.0
+                ),
+                "multi_query_fallback_reason": details.get(
+                    "multi_query_fallback_reason"
+                ),
             },
         }
         return _finalize_conversation_result(
@@ -938,10 +993,45 @@ def conversation_history(
     serialized_turns = []
     for turn in turns:
         sources: list[dict[str, Any]] = []
+        turn_metrics: dict[str, Any] | None = None
         if turn.trace_id is not None:
             trace = db.get(SearchTrace, turn.trace_id)
             if trace is not None:
                 sources = _trace_sources(db, trace)
+                details = trace.details if isinstance(trace.details, dict) else {}
+                turn_metrics = {
+                    "latency_ms": trace.latency_ms,
+                    "prompt_tokens": trace.prompt_tokens,
+                    "completion_tokens": trace.completion_tokens,
+                    "multi_query_requested": details.get(
+                        "multi_query_requested", False
+                    ),
+                    "multi_query_effective": details.get(
+                        "multi_query_effective", False
+                    ),
+                    "multi_query_status": details.get(
+                        "multi_query_status", "disabled"
+                    ),
+                    "multi_query_queries": details.get("multi_query_queries", []),
+                    "multi_query_executed_count": details.get(
+                        "multi_query_executed_count", 0
+                    ),
+                    "multi_query_search_calls": details.get(
+                        "multi_query_search_calls", 0
+                    ),
+                    "multi_query_unique_sources": details.get(
+                        "multi_query_unique_sources", 0
+                    ),
+                    "multi_query_deduplicated_count": details.get(
+                        "multi_query_deduplicated_count", 0
+                    ),
+                    "multi_query_latency_ms": details.get(
+                        "multi_query_latency_ms", 0.0
+                    ),
+                    "multi_query_fallback_reason": details.get(
+                        "multi_query_fallback_reason"
+                    ),
+                }
         serialized_turns.append(
             {
                 "id": str(turn.id),
@@ -954,6 +1044,7 @@ def conversation_history(
                 "llm_provider": turn.llm_provider,
                 "llm_model": turn.llm_model,
                 "sources": sources if turn.role == "assistant" else [],
+                "metrics": turn_metrics if turn.role == "assistant" else None,
                 "created_at": turn.created_at.isoformat(),
             }
         )

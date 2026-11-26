@@ -42,6 +42,11 @@ textarea { min-height: 115px; resize: vertical; border: 1px solid #b8c8bf; borde
 textarea:focus, input:focus, select:focus { outline: 3px solid #85bca73d; border-color: #40836a; }
 .mode-select, .filter-grid label { display: grid; gap: .3rem; color: #5a6b64; font-size: .78rem; font-weight: 700; }
 .request-controls { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: end; gap: .55rem; }
+.multi-query-control { display: flex; align-items: flex-start; gap: .7rem; border: 1px solid #b9d5c8; border-radius: 10px; padding: .75rem; background: #f2faf6; cursor: pointer; }
+.multi-query-control input { width: 1.1rem; height: 1.1rem; margin-top: .15rem; accent-color: #155f45; }
+.multi-query-control span { display: grid; gap: .1rem; }
+.multi-query-control small { font-weight: 400; }
+.multi-query-control.disabled { border-color: #d9dfdb; background: #f5f6f5; cursor: not-allowed; }
 select, input { border: 1px solid #bcc9c2; border-radius: 8px; padding: .62rem .7rem; background: #fff; color: #253b33; }
 .mode { display: inline-flex; align-items: center; width: max-content; border-radius: 999px; padding: .32rem .6rem; font-size: .72rem; font-weight: 800; white-space: nowrap; }
 .mode-baseline { background: #e9eef7; color: #3c526f; }
@@ -59,6 +64,8 @@ select, input { border: 1px solid #bcc9c2; border-radius: 8px; padding: .62rem .
 .outcome-technical_error { background: #fde3e3; color: #882f2f; }
 .answer-meta, .trace-meta, .chips { display: flex; flex-wrap: wrap; gap: .45rem; }
 .answer-meta span, .trace-meta span, .chips span { border-radius: 999px; padding: .35rem .62rem; background: #eef3f0; color: #4f625a; font-size: .75rem; }
+.search-execution { display: grid; gap: .55rem; border-top: 1px solid #e3e8e5; margin-top: .8rem; padding-top: .8rem; }
+.search-execution ol { margin-bottom: 0; }
 .feedback { display: grid; gap: .45rem; border-top: 1px solid #e3e8e5; margin-top: 1rem; padding-top: 1rem; }
 .feedback-actions { display: flex; flex-wrap: wrap; gap: .45rem; }
 .feedback button.selected { border-radius: 8px; padding: .55rem .75rem; background: #1c5c47; color: #fff; }
@@ -103,6 +110,10 @@ mark { border-radius: 3px; background: #f3dd75; padding: .08rem; }
 .metric-card b { display: block; margin-bottom: .2rem; font-size: 1.65rem; letter-spacing: -.035em; }
 .metric-card span { display: block; color: #52635b; }
 .chart-panel { overflow: hidden; }
+.analytics-table-wrap { overflow-x: auto; }
+.analytics-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.analytics-table th, .analytics-table td { border-bottom: 1px solid #e1e7e3; padding: .6rem; text-align: left; white-space: nowrap; }
+.analytics-table thead th { color: #486057; background: #f3f7f4; }
 .bars { display: grid; gap: .6rem; }
 .bar-row { display: grid; grid-template-columns: 90px minmax(100px, 1fr) 40px minmax(160px, auto); align-items: center; gap: .75rem; }
 .bar-row time, .bar-row small { color: #69766f; font-size: .78rem; }

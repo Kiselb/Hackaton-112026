@@ -13,6 +13,15 @@ function tabIdentity(key: string, prefix: string): string {
 const DEMO_USER = tabIdentity("clip-demo-user", "web-demo");
 const DEMO_SESSION = tabIdentity("clip-demo-session", "browser");
 
+const multiQueryStatusLabels: Record<string, string> = {
+  applied: "применён",
+  partial_retrieval: "частично применён",
+  expansion_unavailable: "расширение недоступно",
+  skipped_llm_budget: "пропущен из-за бюджета",
+  not_run: "не запускался",
+  disabled: "выключен",
+};
+
 type Mode = "baseline" | "agent";
 type LlmProvider = "ollama" | "openai";
 type Outcome = "answered" | "clarification_required" | "quality_review_required" |
@@ -75,6 +84,26 @@ type Analytics = {
   modes: {baseline: number; agent: number; baseline_share: number; agent_share: number};
   fallback_count: number;
   answer_correctness: "not_measured";
+  multi_query: {
+    requested: number;
+    not_requested: number;
+    successful_expansions: number;
+    fallbacks: number;
+    groups: Record<"on" | "off", {
+      queries: number;
+      average_retrieval_calls: number;
+      average_latency_ms: number | null;
+      p95_latency_ms: number | null;
+      average_unique_sources: number;
+      input_tokens: number;
+      output_tokens: number;
+      answered_share: number;
+      quality_review_required_share: number;
+      clarification_required_share: number;
+      conflict_detected_share: number;
+      technical_errors: number;
+    }>;
+  };
   time_series: Array<{
     date: string;
     queries: number;
@@ -128,6 +157,17 @@ type AskMetrics = {
   citations_valid?: boolean;
   llm_provider?: LlmProvider;
   llm_model?: string;
+  multi_query_requested?: boolean;
+  multi_query_effective?: boolean;
+  multi_query_status?: string;
+  multi_query_queries?: string[];
+  multi_query_generated_count?: number;
+  multi_query_executed_count?: number;
+  multi_query_search_calls?: number;
+  multi_query_unique_sources?: number;
+  multi_query_deduplicated_count?: number;
+  multi_query_latency_ms?: number;
+  multi_query_fallback_reason?: string | null;
 };
 
 type AskResult = {
@@ -186,6 +226,11 @@ type Capabilities = {
   llm: {
     default_provider: LlmProvider;
     providers: LlmProviderCapability[];
+  };
+  multi_query: {
+    available: boolean;
+    default_enabled: boolean;
+    max_variants: number;
   };
 };
 
@@ -436,6 +481,9 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
   const [question, setQuestion] = useState(initialQuestion);
   const [requestedMode, setRequestedMode] = useState<Mode>(capabilities.default_mode);
   const [llmProvider, setLlmProvider] = useState<LlmProvider>(capabilities.llm.default_provider);
+  const [multiQueryEnabled, setMultiQueryEnabled] = useState(
+    capabilities.multi_query.default_enabled,
+  );
   const initialProvider = capabilities.llm.providers.find(
     (provider) => provider.id === capabilities.llm.default_provider,
   ) ?? capabilities.llm.providers[0];
@@ -453,6 +501,7 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
   const lastSubmission = useRef("");
 
   useEffect(() => setRequestedMode(capabilities.default_mode), [capabilities.default_mode]);
+  useEffect(() => setMultiQueryEnabled(capabilities.multi_query.default_enabled), [capabilities]);
   useEffect(() => {
     setLlmProvider(capabilities.llm.default_provider);
     const selected = capabilities.llm.providers.find(
@@ -523,6 +572,11 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
           llm_model: llmModel,
           ...(conversationId ? {conversation_id: conversationId} : {}),
           ...(capabilities.agent_demo_override_enabled ? {mode: requestedMode} : {}),
+          multi_query_enabled: (
+            capabilities.multi_query.available
+            && (capabilities.agent_demo_override_enabled ? requestedMode : capabilities.default_mode) === "agent"
+            && multiQueryEnabled
+          ),
         }),
       });
       if (!response.ok) throw new Error(await responseError(response));
@@ -565,6 +619,7 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
     if (!conversationId || !conversationToken) return;
     setBusy(true);
     setError("");
+    setMultiQueryEnabled(capabilities.multi_query.default_enabled);
     try {
       const response = await fetch(`/api/v1/conversations/${conversationId}/close`, {
         method: "POST",
@@ -598,6 +653,9 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
   }
 
   const awaiting = conversationStatus === "awaiting_clarification";
+  const agentMode = (
+    capabilities.agent_demo_override_enabled ? requestedMode : capabilities.default_mode
+  ) === "agent";
   const canSubmit = !busy && conversationStatus !== "closed" && conversationStatus !== "completed";
   return <section className="stack">
     <form className="panel ask" onSubmit={submitQuestion}>
@@ -629,6 +687,17 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
       {capabilities.agent_demo_override_enabled && <p className="notice compact">
         Локальный demo override включён конфигурацией сервера. Он действует только для этого запроса.
       </p>}
+      <label className={`multi-query-control ${!agentMode || !capabilities.multi_query.available ? "disabled" : ""}`}>
+        <input
+          checked={multiQueryEnabled}
+          disabled={!agentMode || !capabilities.multi_query.available}
+          onChange={(event) => setMultiQueryEnabled(event.target.checked)}
+          type="checkbox"
+        />
+        <span><b>Multi-Query — расширенный поиск</b><small>Создаёт дополнительные формулировки вопроса, чтобы найти больше подходящих фрагментов документов.</small></span>
+      </label>
+      {!agentMode && <p className="muted compact">Multi-Query доступен только для AI-Агента; Базовый RAG использует прежнюю стратегию поиска.</p>}
+      {!capabilities.multi_query.available && <p className="muted compact">Multi-Query отключён конфигурацией сервера.</p>}
       <label htmlFor="question">{awaiting ? "Ваше уточнение" : "Сформулируйте вопрос"}</label>
       <textarea id="question" maxLength={1000} required value={question} onChange={(event) => {
         setQuestion(event.target.value);
@@ -657,6 +726,20 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
           <span>{formatNumber(message.metrics.prompt_tokens)} input tokens</span>
           <span>{formatNumber(message.metrics.completion_tokens)} output tokens</span>
           {message.llm_provider && <span>{message.llm_provider === "openai" ? "OpenAI" : "Ollama"} · {message.llm_model}</span>}
+        </div>}
+        {message.metrics?.multi_query_requested && <div className="search-execution">
+          <div className="answer-meta">
+            <span>Multi-Query: {multiQueryStatusLabels[message.metrics.multi_query_status ?? ""] ?? "не применён"}</span>
+            <span>Формулировок: {message.metrics.multi_query_executed_count ?? 0}</span>
+            <span>Retrieval-вызовов: {message.metrics.multi_query_search_calls ?? 0}</span>
+            <span>Уникальных источников: {message.metrics.multi_query_unique_sources ?? 0}</span>
+            <span>Multi-Query latency: {formatNumber(message.metrics.multi_query_latency_ms)} мс</span>
+          </div>
+          {message.metrics.multi_query_fallback_reason && <p className="notice compact">Расширение выполнено не полностью: {message.metrics.multi_query_fallback_reason}.</p>}
+          {message.metrics.multi_query_queries && message.metrics.multi_query_queries.length > 0 && <details>
+            <summary>Как выполнялся поиск</summary>
+            <ol>{message.metrics.multi_query_queries.map((query, index) => <li key={`${query}-${index}`}>{query}</li>)}</ol>
+          </details>}
         </div>}
         {(message.outcome === "quality_review_required" || message.outcome === "conflict_detected") && message.trace_id &&
           <QualityEscalation traceId={message.trace_id} conversationToken={conversationToken} />}
@@ -693,6 +776,10 @@ function AnalyticsView({analytics}: {analytics: Analytics | null}) {
       <MetricCard value={analytics.p95_latency_ms == null ? "не измерено" : `${formatNumber(analytics.p95_latency_ms)} мс`} label="p95 latency" />
       <MetricCard value={analytics.llm_calls} label="LLM-вызовов" />
       <MetricCard value={analytics.fallback_count} label="Fallback" />
+      <MetricCard value={analytics.multi_query.requested} label="Multi-Query запрошен" />
+      <MetricCard value={analytics.multi_query.not_requested} label="Multi-Query выключен" />
+      <MetricCard value={analytics.multi_query.successful_expansions} label="Multi-Query применён" />
+      <MetricCard value={analytics.multi_query.fallbacks} label="Multi-Query fallback" />
       <MetricCard value={analytics.tokens_measurement === "measured" ? formatNumber(analytics.input_tokens) : "не измерено"} label="Input tokens" />
       <MetricCard value={analytics.tokens_measurement === "measured" ? formatNumber(analytics.output_tokens) : "не измерено"} label="Output tokens" />
       <MetricCard value={`${Math.round(analytics.modes.baseline_share * 100)}%`} label="Базовый RAG" note={`${analytics.modes.baseline} запросов`} />
@@ -706,6 +793,17 @@ function AnalyticsView({analytics}: {analytics: Analytics | null}) {
           <b>{point.queries}</b><small>{point.technical_errors} ошибок · {point.manual_review_required} на проверку</small>
         </div>)}</div>}
     </article>
+    <article className="panel">
+      <span className="section-kicker">Multi-Query</span><h2>Фактически применённый режим</h2>
+      <p className="muted">Answered — операционный outcome, а не измеренная accuracy.</p>
+      <div className="analytics-table-wrap"><table className="analytics-table">
+        <thead><tr><th>Режим</th><th>Запросов</th><th>Retrieval avg</th><th>Latency avg / p95</th><th>Unique avg</th><th>Tokens in / out</th><th>Answered</th><th>Quality / clarify / conflict</th><th>Ошибки</th></tr></thead>
+        <tbody>{(["off", "on"] as const).map((name) => {
+          const group = analytics.multi_query.groups[name];
+          return <tr key={name}><th>{name === "on" ? "ON" : "OFF"}</th><td>{group.queries}</td><td>{group.average_retrieval_calls}</td><td>{group.average_latency_ms ?? "—"} / {group.p95_latency_ms ?? "—"}</td><td>{group.average_unique_sources}</td><td>{group.input_tokens} / {group.output_tokens}</td><td>{Math.round(group.answered_share * 100)}%</td><td>{Math.round(group.quality_review_required_share * 100)}% / {Math.round(group.clarification_required_share * 100)}% / {Math.round(group.conflict_detected_share * 100)}%</td><td>{group.technical_errors}</td></tr>;
+        })}</tbody>
+      </table></div>
+    </article>
   </section>;
 }
 
@@ -716,6 +814,7 @@ function TraceViewer({trace, onFeedback}: {trace: TraceDetail; onFeedback: () =>
   const validation = trace.details.validation as Record<string, unknown> | undefined;
   const conversationId = typeof trace.details.conversation_id === "string" ? trace.details.conversation_id : null;
   const conversationTurn = typeof trace.details.conversation_turn === "number" ? trace.details.conversation_turn : null;
+  const multiQueryRequested = trace.details.multi_query_requested === true;
   return <div className="trace-detail stack">
     <article className="panel">
       <div className="trace-heading"><div><span className="section-kicker">Trace {trace.id}</span><h2>{trace.question}</h2></div><ModeBadge mode={trace.mode} /></div>
@@ -739,6 +838,13 @@ function TraceViewer({trace, onFeedback}: {trace: TraceDetail; onFeedback: () =>
           </details></li>;
         })}</ol>}
       {queries.length > 0 && <div className="trace-block"><h3>Поисковые подзапросы</h3><ol>{queries.map((query, index) => <li key={`${query}-${index}`}>{query}</li>)}</ol></div>}
+      {multiQueryRequested && <div className="trace-block"><h3>Multi-Query</h3><div className="answer-meta">
+        <span>{multiQueryStatusLabels[String(trace.details.multi_query_status ?? "")] ?? "не применён"}</span>
+        <span>Retrieval: {String(trace.details.multi_query_search_calls ?? 0)}</span>
+        <span>Unique: {String(trace.details.multi_query_unique_sources ?? 0)}</span>
+        <span>Deduplicated: {String(trace.details.multi_query_deduplicated_count ?? 0)}</span>
+        <span>{String(trace.details.multi_query_latency_ms ?? 0)} мс</span>
+      </div></div>}
       {gaps.length > 0 && <div className="trace-block warning"><h3>Evidence gaps</h3><pre>{JSON.stringify(gaps, null, 2)}</pre></div>}
       {validation && <div className="trace-block"><h3>Результат проверки</h3><pre>{JSON.stringify(validation, null, 2)}</pre></div>}
       {Boolean(trace.details.agent_fallback_reason) && <div className="notice danger">Agent fallback: {String(trace.details.agent_fallback_reason)}</div>}

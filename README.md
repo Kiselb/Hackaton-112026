@@ -17,6 +17,7 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - финальная проверка `active=true` и `status=ready` по PostgreSQL;
 - опциональный локальный CrossEncoder reranking после проверки активности;
 - bounded AI-Агент по умолчанию с input guardrails, evidence assessment и fail-closed answer validation;
+- request-level Multi-Query для AI-Агента: безопасное query expansion, межзапросный RRF и прозрачные затраты;
 - request-level выбор локального Ollama или OpenAI Responses API с единым LLM-интерфейсом;
 - stateful-уточнения с PostgreSQL-историей, повторным retrieval и изоляцией диалогов;
 - подтверждаемая пользователем эскалация в службу качества, безопасный SMTP и
@@ -75,6 +76,12 @@ AI-Агент настраивается через `AGENT_ENABLED`, `AGENT_MAX_
 При исключении agent runtime возвращается контролируемый `technical_error`; автоматический
 переход в Базовый RAG запрещён. Strict outcome и порядок безопасного обновления стенда:
 [docs/CLIP012_STRICT_AGENT.md](docs/CLIP012_STRICT_AGENT.md).
+
+Multi-Query разрешён сервером через `MULTI_QUERY_ENABLED=true`, но выключен для запроса
+по умолчанию (`MULTI_QUERY_DEFAULT_ENABLED=false`). `MULTI_QUERY_MAX_VARIANTS=2`
+включает исходный вопрос. Переключатель доступен в поиске только для AI-Агента; лимиты
+agent search/LLM остаются общими и обязательная grounding validation не жертвуется ради
+расширения: [docs/CLIP016_MULTI_QUERY.md](docs/CLIP016_MULTI_QUERY.md).
 
 LLM по умолчанию остаётся `ollama`/`qwen3.5:9b`. Опциональный OpenAI включается только
 backend-настройками, использует Responses API с `store=false` и серверный allowlist
@@ -219,7 +226,7 @@ Smoke следует запускать на свежих проектных р�
 - `POST /api/v1/ask`;
 - `GET /api/v1/conversations/{id}` — история только с корректным ownership token;
 - `POST /api/v1/conversations/{id}/close` — завершение без LLM-вызова;
-- `GET /api/v1/capabilities` — demo override и безопасный список LLM-провайдеров/моделей;
+- `GET /api/v1/capabilities` — demo override, безопасный список LLM и конфигурация Multi-Query;
 - `GET /api/v1/admin/analytics` — агрегаты, mode share, latency/tokens и динамика;
 - `GET /api/v1/admin/traces` — фильтруемый список с `limit`/`offset`;
 - `GET /api/v1/admin/traces/{id}` — ответ, evidence и безопасная проекция trajectory;

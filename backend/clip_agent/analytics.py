@@ -166,6 +166,32 @@ def aggregate_traces(
     clarification_count = 0
     confirmed_answers = 0
     quality_review_transitions = 0
+    multi_query_requested = 0
+    multi_query_not_requested = 0
+    multi_query_successful_expansions = 0
+    multi_query_fallbacks = 0
+    multi_query_groups: dict[str, dict[str, Any]] = {
+        "on": {
+            "queries": 0,
+            "retrieval_calls": 0,
+            "latencies": [],
+            "unique_sources": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "outcomes": defaultdict(int),
+            "technical_errors": 0,
+        },
+        "off": {
+            "queries": 0,
+            "retrieval_calls": 0,
+            "latencies": [],
+            "unique_sources": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "outcomes": defaultdict(int),
+            "technical_errors": 0,
+        },
+    }
     by_day: defaultdict[str, dict[str, int]] = defaultdict(
         lambda: {"queries": 0, "technical_errors": 0, "manual_review_required": 0}
     )
@@ -179,6 +205,33 @@ def aggregate_traces(
         clarification_count += int(result["outcome"] == "clarification_required")
         confirmed_answers += int(result["outcome"] == "answered")
         quality_review_transitions += int(result["outcome"] == "quality_review_required")
+        if trace_mode(trace) == "agent":
+            requested = bool(details.get("multi_query_requested"))
+            effective = bool(details.get("multi_query_effective"))
+            multi_query_requested += int(requested)
+            multi_query_not_requested += int(not requested)
+            multi_query_successful_expansions += int(
+                effective and details.get("multi_query_status") == "applied"
+            )
+            multi_query_fallbacks += int(
+                requested and not effective
+                or details.get("multi_query_status") == "partial_retrieval"
+            )
+            group = multi_query_groups["on" if effective else "off"]
+            group["queries"] += 1
+            group["retrieval_calls"] += int(details.get("search_calls") or 0)
+            group["unique_sources"] += int(
+                details.get("retrieved_unique_chunks")
+                or details.get("multi_query_unique_sources")
+                or trace.selected_count
+                or 0
+            )
+            group["input_tokens"] += trace.prompt_tokens or 0
+            group["output_tokens"] += trace.completion_tokens or 0
+            if trace.latency_ms is not None:
+                group["latencies"].append(trace.latency_ms)
+            group["outcomes"][result["outcome"] or "unknown"] += 1
+            group["technical_errors"] += int(result["technical_status"] == "error")
         for category in result["categories"]:
             category_counts[category] += 1
         modes[trace_mode(trace)] += 1
@@ -200,6 +253,42 @@ def aggregate_traces(
     total = len(rows)
     average = round(sum(latencies) / len(latencies), 1) if latencies else None
     p95 = _nearest_rank_p95(latencies)
+    multi_query_summary: dict[str, dict[str, Any]] = {}
+    for name, group in multi_query_groups.items():
+        count = int(group["queries"])
+        latencies_for_group = list(group["latencies"])
+        outcomes = dict(group["outcomes"])
+        multi_query_summary[name] = {
+            "queries": count,
+            "average_retrieval_calls": (
+                round(group["retrieval_calls"] / count, 2) if count else 0
+            ),
+            "average_latency_ms": (
+                round(sum(latencies_for_group) / len(latencies_for_group), 1)
+                if latencies_for_group
+                else None
+            ),
+            "p95_latency_ms": _nearest_rank_p95(latencies_for_group),
+            "average_unique_sources": (
+                round(group["unique_sources"] / count, 2) if count else 0
+            ),
+            "input_tokens": group["input_tokens"],
+            "output_tokens": group["output_tokens"],
+            "answered_share": round(outcomes.get("answered", 0) / count, 4) if count else 0,
+            "quality_review_required_share": (
+                round(outcomes.get("quality_review_required", 0) / count, 4)
+                if count else 0
+            ),
+            "clarification_required_share": (
+                round(outcomes.get("clarification_required", 0) / count, 4)
+                if count else 0
+            ),
+            "conflict_detected_share": (
+                round(outcomes.get("conflict_detected", 0) / count, 4)
+                if count else 0
+            ),
+            "technical_errors": group["technical_errors"],
+        }
     return {
         "total_queries": total,
         "total_conversations": len(conversation_ids),
@@ -224,6 +313,13 @@ def aggregate_traces(
             "agent_share": round(modes["agent"] / total, 4) if total else 0,
         },
         "fallback_count": fallback_count,
+        "multi_query": {
+            "requested": multi_query_requested,
+            "not_requested": multi_query_not_requested,
+            "successful_expansions": multi_query_successful_expansions,
+            "fallbacks": multi_query_fallbacks,
+            "groups": multi_query_summary,
+        },
         "categories": dict(category_counts),
         "answer_correctness": "not_measured",
         "time_series": [

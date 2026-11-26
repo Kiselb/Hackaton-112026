@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     agent_max_search_calls: int = Field(default=3, ge=1, le=10)
     agent_max_retries: int = Field(default=1, ge=0, le=3)
     agent_max_llm_calls: int = Field(default=4, ge=1, le=10)
+    multi_query_enabled: bool = True
+    multi_query_default_enabled: bool = False
+    multi_query_max_variants: int = Field(default=2, ge=1, le=5)
     agent_demo_override_enabled: bool = False
     conversation_ttl_minutes: int = Field(default=60, ge=5, le=1440)
     conversation_max_clarifications: int = Field(default=2, ge=1, le=5)

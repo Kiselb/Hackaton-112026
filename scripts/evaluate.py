@@ -374,6 +374,7 @@ def evaluate(args: argparse.Namespace) -> int:
                         "question": case["question"],
                         "user_id": "evaluation-lab",
                         "session_id": experiment_id,
+                        "multi_query_enabled": args.multi_query,
                     },
                 )
                 response.raise_for_status()
@@ -447,6 +448,8 @@ def evaluate(args: argparse.Namespace) -> int:
             "max_search_calls": settings.agent_max_search_calls,
             "max_retries": settings.agent_max_retries,
             "max_llm_calls": settings.agent_max_llm_calls,
+            "multi_query_requested": args.multi_query,
+            "multi_query_max_variants": settings.multi_query_max_variants,
         },
         "readiness": ready,
         "summary": aggregate_results(results),
@@ -470,6 +473,11 @@ def main() -> int:
         help="Explicit corpus JSON; defaults to eval/corpora/<dataset stem>/corpus.json",
     )
     parser.add_argument("--output-dir", default="eval/results")
+    parser.add_argument(
+        "--multi-query",
+        action="store_true",
+        help="Request Multi-Query for every AI-Agent case in this run",
+    )
     parser.add_argument("--compare", nargs=2, metavar=("LEFT_RUN", "RIGHT_RUN"))
     parser.add_argument("--comparison-output", type=Path)
     args = parser.parse_args()

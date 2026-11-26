@@ -1,5 +1,7 @@
 from uuid import uuid4
 
+import pytest
+
 from clip_agent import llm as llm_module
 from clip_agent import main
 from clip_agent.config import Settings
@@ -59,6 +61,61 @@ class Response:
 def test_agent_is_default_only_when_configuration_does_not_override_it():
     assert Settings.model_fields["agent_enabled"].default is True
     assert Settings(_env_file=None, agent_enabled=False).agent_enabled is False
+
+
+def test_multi_query_capability_defaults_are_safe():
+    assert Settings.model_fields["multi_query_enabled"].default is True
+    assert Settings.model_fields["multi_query_default_enabled"].default is False
+    assert Settings.model_fields["multi_query_max_variants"].default == 2
+
+
+def test_capabilities_publish_only_safe_multi_query_configuration(monkeypatch):
+    monkeypatch.setattr(main.settings, "multi_query_enabled", True)
+    monkeypatch.setattr(main.settings, "multi_query_default_enabled", False)
+    monkeypatch.setattr(main.settings, "multi_query_max_variants", 2)
+
+    result = main.capabilities()
+
+    assert result["multi_query"] == {
+        "available": True,
+        "default_enabled": False,
+        "max_variants": 2,
+    }
+
+
+def test_baseline_explicitly_rejects_multi_query(monkeypatch):
+    monkeypatch.setattr(main.settings, "agent_demo_override_enabled", True)
+    monkeypatch.setattr(main.settings, "multi_query_enabled", True)
+
+    with pytest.raises(main.HTTPException) as error:
+        main.ask(
+            main.AskRequest(
+                question="Какой срок?", mode="baseline", multi_query_enabled=True
+            ),
+            db=object(),
+        )
+
+    assert error.value.status_code == 409
+
+
+def test_server_disabled_multi_query_is_not_silently_ignored(monkeypatch):
+    monkeypatch.setattr(main.settings, "multi_query_enabled", False)
+
+    with pytest.raises(main.HTTPException) as error:
+        main.ask(
+            main.AskRequest(question="Какой срок?", multi_query_enabled=True),
+            db=object(),
+        )
+
+    assert error.value.status_code == 409
+
+
+def test_openapi_ask_contract_contains_optional_multi_query_field():
+    schema = main.app.openapi()
+    request_schema = schema["components"]["schemas"]["AskRequest"]
+
+    assert "multi_query_enabled" in request_schema["properties"]
+    assert "multi_query_enabled" not in request_schema.get("required", [])
 
 
 def test_invalid_input_is_structured_and_skips_retrieval(monkeypatch):

@@ -163,6 +163,103 @@ def test_simple_route_skips_planner():
     assert state["outcome"] == "answered"
 
 
+def test_multi_query_expands_simple_question_and_preserves_grounding_budget():
+    retriever, llm = Retriever(), ScriptedLlm()
+    state = agent(retriever, llm).invoke(
+        "Какой лимит установлен?", "u", "s", "r", multi_query_enabled=True
+    )
+
+    assert state["trajectory"][0]["decision"] == "planned_with_multi_query"
+    assert retriever.queries[0] == "Какой лимит установлен?"
+    assert len(retriever.queries) == 2
+    assert state["multi_query_effective"] is True
+    assert state["multi_query_status"] == "applied"
+    assert state["llm_calls"] == 4
+    assert "Validate whether" in llm.calls[-1]
+    assert state["validation"]["valid"] is True
+
+
+def test_multi_query_skips_expansion_when_validator_budget_would_be_lost():
+    retriever, llm = Retriever(), ScriptedLlm()
+    state = agent(retriever, llm, llm_calls=3).invoke(
+        "Какой лимит установлен?", "u", "s", "r", multi_query_enabled=True
+    )
+
+    assert retriever.queries == ["Какой лимит установлен?"]
+    assert state["multi_query_effective"] is False
+    assert state["multi_query_status"] == "skipped_llm_budget"
+    assert state["multi_query_fallback_reason"] == "grounding_validation_budget_reserved"
+    assert state["validation"]["valid"] is True
+
+
+def test_multi_query_removes_duplicates_and_rejects_scope_drift():
+    class DuplicatePlanner(ScriptedLlm):
+        def __call__(self, prompt: str):
+            if "Decompose" in prompt:
+                self.calls.append(prompt)
+                return json.dumps(
+                    {
+                        "aspects": [{"aspect_id": "aspect-1", "question": "Кто назначает?"}],
+                        "search_queries": [
+                            "В Дирекции ИБ кто назначает руководителя проекта?",
+                            "Кто назначает руководителя проекта в технической дирекции?",
+                        ],
+                    }
+                ), {"prompt_eval_count": 2, "eval_count": 1}
+            return super().__call__(prompt)
+
+    question = "Кто назначает руководителя проекта в Дирекции ИБ?"
+    retriever, llm = Retriever(), DuplicatePlanner()
+    state = agent(retriever, llm).invoke(
+        question, "u", "s", "r", multi_query_enabled=True
+    )
+
+    assert retriever.queries == [question]
+    assert state["multi_query_status"] == "expansion_unavailable"
+    assert state["multi_query_generated_count"] == 0
+
+
+def test_multi_query_rrf_merges_ranks_and_deduplicates_chunk_ids():
+    class RankedRetriever:
+        def __init__(self):
+            self.queries: list[str] = []
+
+        def __call__(self, query: str, limit: int | None):
+            self.queries.append(query)
+            if len(self.queries) == 1:
+                return [source("a"), source("b")], 2, trace()
+            return [source("b"), source("c")], 2, trace()
+
+    retriever, llm = RankedRetriever(), ScriptedLlm()
+    state = agent(retriever, llm).invoke(
+        "Какой лимит установлен?", "u", "s", "r", multi_query_enabled=True
+    )
+
+    assert [item["chunk_id"] for item in state["evidence"]] == ["b", "a", "c"]
+    assert len(state["evidence"][0]["query_contributions"]) == 2
+    assert state["multi_query_unique_sources"] == 3
+    assert state["multi_query_deduplicated_count"] == 1
+
+
+def test_multi_query_continues_with_original_when_alternative_retrieval_fails():
+    class PartialRetriever(Retriever):
+        def __call__(self, query: str, limit: int | None):
+            self.queries.append(query)
+            if len(self.queries) == 2:
+                raise RuntimeError("synthetic retrieval failure")
+            return [source("original")], 1, trace()
+
+    retriever, llm = PartialRetriever(), ScriptedLlm()
+    state = agent(retriever, llm).invoke(
+        "Какой лимит установлен?", "u", "s", "r", multi_query_enabled=True
+    )
+
+    assert state["multi_query_status"] == "partial_retrieval"
+    assert state["multi_query_fallback_reason"] == "one_or_more_retrievals_failed"
+    assert [item["chunk_id"] for item in state["evidence"]] == ["original"]
+    assert state["outcome"] == "answered"
+
+
 def test_multi_aspect_plan_preserves_original_question():
     question = "Чем отличаются первый и второй лимиты?"
     retriever, llm = Retriever(), ScriptedLlm()

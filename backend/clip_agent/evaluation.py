@@ -101,6 +101,11 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             return None
         return len(expected_set.intersection(retrieved[:k])) / len(expected_set)
 
+    def precision_at(k: int) -> float | None:
+        if not expected_set:
+            return None
+        return len(expected_set.intersection(retrieved[:k])) / k
+
     first_rank = next(
         (rank for rank, item in enumerate(retrieved, start=1) if item in expected_set), None
     )
@@ -178,6 +183,10 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "document_recall_at_3": recall_at(3),
             "document_recall_at_5": recall_at(5),
             "document_recall_at_8": recall_at(8),
+            "document_precision_at_1": precision_at(1),
+            "document_precision_at_3": precision_at(3),
+            "document_precision_at_5": precision_at(5),
+            "document_precision_at_8": precision_at(8),
             "mrr": 1 / first_rank if first_rank else (0.0 if expected_set else None),
             "ndcg_at_5": ndcg_at(5),
             "expected_document_coverage": recall_at(len(retrieved)),
@@ -209,6 +218,9 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "agent_search_calls": metrics.get("agent_search_calls", 1),
             "agent_llm_calls": metrics.get("agent_llm_calls", 1),
             "agent_steps": metrics.get("agent_steps"),
+            "multi_query_effective": metrics.get("multi_query_effective", False),
+            "multi_query_search_calls": metrics.get("multi_query_search_calls", 0),
+            "multi_query_unique_sources": metrics.get("multi_query_unique_sources", 0),
         },
         "manual_review_required": manual_review_required,
         "manual_review_reason": (
@@ -250,6 +262,10 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "document_recall_at_3": _mean(values("document_recall_at_3")),
         "document_recall_at_5": _mean(values("document_recall_at_5")),
         "document_recall_at_8": _mean(values("document_recall_at_8")),
+        "document_precision_at_1": _mean(values("document_precision_at_1")),
+        "document_precision_at_3": _mean(values("document_precision_at_3")),
+        "document_precision_at_5": _mean(values("document_precision_at_5")),
+        "document_precision_at_8": _mean(values("document_precision_at_8")),
         "mrr": _mean(values("mrr")),
         "ndcg_at_5": _mean(values("ndcg_at_5")),
         "expected_document_coverage": _mean(values("expected_document_coverage")),
@@ -305,6 +321,8 @@ def compare_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "document_recall_at_1", "document_recall_at_3", "document_recall_at_5",
         "document_recall_at_8", "mrr", "ndcg_at_5", "expected_document_coverage",
+        "document_precision_at_1", "document_precision_at_3",
+        "document_precision_at_5", "document_precision_at_8",
         "all_required_sources_at_8_rate", "expected_fragment_coverage",
         "citations_present_rate",
         "citation_ids_admissible_rate", "citation_ids_valid_rate",
