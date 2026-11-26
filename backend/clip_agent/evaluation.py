@@ -351,6 +351,16 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "multi_query_effective": metrics.get("multi_query_effective", False),
             "multi_query_search_calls": metrics.get("multi_query_search_calls", 0),
             "multi_query_unique_sources": metrics.get("multi_query_unique_sources", 0),
+            "assessment_latency_ms": metrics.get("assessment_latency_ms", 0),
+            "assessment_malformed_responses": metrics.get(
+                "assessment_malformed_responses", 0
+            ),
+            "assessment_empty_responses": metrics.get(
+                "assessment_empty_responses", 0
+            ),
+            "assessment_truncated_responses": metrics.get(
+                "assessment_truncated_responses", 0
+            ),
         },
         "manual_review_required": manual_review_required,
         "manual_review_reason": (
@@ -442,6 +452,9 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "grounded_answer_rate": _mean([float(v) for v in values("grounded_answer")]),
         "outcome_accuracy": _mean([float(v) for v in values("outcome_correct")]),
+        "technical_error_rate": _mean(
+            [float(value == "technical_error") for value in values("outcome")]
+        ),
         "clarification_quality": _mean(
             [float(v) for v in values("clarification_success")]
         ),
@@ -457,6 +470,17 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "rerank_latency_ms": {
             "mean": _mean(values("rerank_latency_ms")),
             "total": round(sum(values("rerank_latency_ms")), 4),
+        },
+        "assessment": {
+            "latency_ms_mean": _mean(values("assessment_latency_ms")),
+            "latency_ms_total": round(sum(values("assessment_latency_ms")), 4),
+            "malformed_responses_total": sum(
+                values("assessment_malformed_responses")
+            ),
+            "empty_responses_total": sum(values("assessment_empty_responses")),
+            "truncated_responses_total": sum(
+                values("assessment_truncated_responses")
+            ),
         },
         "tokens": {
             "input_total": sum(values("input_tokens")),

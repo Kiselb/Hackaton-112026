@@ -79,9 +79,15 @@ def build_answer_prompt(question: str, sources: list[dict[str, Any]]) -> str:
 def build_grounding_validation_prompt(
     question: str, draft: str, sources: list[dict[str, Any]]
 ) -> str:
+    cited_numbers = {
+        int(value)
+        for value in CITATION_PATTERN.findall(draft)
+        if 1 <= int(value) <= len(sources)
+    }
     evidence = "\n\n".join(
         f"[{index}] {prompt_evidence_text(source)}"
         for index, source in enumerate(sources, start=1)
+        if index in cited_numbers
     )
     return (
         "Return JSON only. Validate whether every material corporate claim in the Russian draft "

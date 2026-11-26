@@ -8,6 +8,7 @@ from clip_agent.llm import (
     LlmSelection,
     LlmSelectionError,
     LlmSession,
+    OllamaProvider,
     OpenAIProvider,
     llm_capabilities,
     resolve_llm_selection,
@@ -105,6 +106,125 @@ def test_openai_responses_request_is_private_bounded_and_usage_is_normalized() -
     assert "test-secret-key" not in str(request)
 
 
+def test_openai_operation_output_budget_overrides_global_default() -> None:
+    settings = configured_settings(openai_max_output_tokens=2048)
+    responses = FakeResponses(completed_response('{"ok":true}'))
+    provider = OpenAIProvider(
+        LlmSelection("openai", "gpt-6.2-sol"),
+        settings,
+        SimpleNamespace(responses=responses),
+    )
+
+    provider.generate("test", max_output_tokens=777)
+
+    assert responses.requests[0]["max_output_tokens"] == 777
+
+
+def test_ollama_structured_output_and_operation_budget_are_forwarded(monkeypatch) -> None:
+    settings = configured_settings(ollama_num_predict=512)
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "message": {"content": '{"ok":true}'},
+                "prompt_eval_count": 10,
+                "eval_count": 4,
+                "done_reason": "stop",
+            }
+
+    def fake_post(url, *, json, timeout):
+        captured.update({"url": url, "payload": json, "timeout": timeout})
+        return Response()
+
+    monkeypatch.setattr("clip_agent.llm.httpx.post", fake_post)
+    provider = OllamaProvider(LlmSelection("ollama", settings.ollama_model), settings)
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+
+    text, usage = provider.generate(
+        "test",
+        json_schema=schema,
+        schema_name="check",
+        max_output_tokens=777,
+        context_window_tokens=8192,
+    )
+
+    assert text == '{"ok":true}'
+    assert captured["payload"]["format"] == schema
+    assert captured["payload"]["options"]["num_predict"] == 777
+    assert captured["payload"]["options"]["num_ctx"] == 8192
+    assert usage["json_schema_requested"] is True
+    assert usage["output_limit_reached"] is False
+
+
+def test_ollama_output_limit_is_not_parsed_as_complete_json(monkeypatch) -> None:
+    settings = configured_settings()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "message": {"content": '{"ok":'},
+                "prompt_eval_count": 10,
+                "eval_count": 128,
+                "done_reason": "length",
+            }
+
+    monkeypatch.setattr(
+        "clip_agent.llm.httpx.post", lambda *args, **kwargs: Response()
+    )
+    provider = OllamaProvider(LlmSelection("ollama", settings.ollama_model), settings)
+
+    with pytest.raises(LlmProviderError) as error:
+        provider.generate(
+            "test",
+            json_schema={"type": "object"},
+            max_output_tokens=128,
+        )
+
+    assert error.value.category == "output_limit"
+    assert error.value.usage["done_reason"] == "length"
+    assert error.value.usage["eval_count"] == 128
+
+
+def test_ollama_unstructured_length_preserves_legacy_text_with_telemetry(
+    monkeypatch,
+) -> None:
+    settings = configured_settings()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "message": {"content": "Частичный текст"},
+                "prompt_eval_count": 10,
+                "eval_count": 128,
+                "done_reason": "length",
+            }
+
+    monkeypatch.setattr(
+        "clip_agent.llm.httpx.post", lambda *args, **kwargs: Response()
+    )
+    provider = OllamaProvider(LlmSelection("ollama", settings.ollama_model), settings)
+
+    text, usage = provider.generate("test", max_output_tokens=128)
+
+    assert text == "Частичный текст"
+    assert usage["output_limit_reached"] is True
+
+
 @pytest.mark.parametrize(
     ("response", "category"),
     [
@@ -192,6 +312,34 @@ def test_incomplete_response_usage_is_still_counted() -> None:
 
     assert session.input_tokens == 20
     assert session.output_tokens == 64
+
+
+def test_total_token_budget_error_keeps_final_call_usage() -> None:
+    settings = configured_settings(llm_max_total_tokens_per_request=256)
+    response = SimpleNamespace(
+        status="completed",
+        output_text='{"ok":true}',
+        output=[],
+        incomplete_details=None,
+        usage=SimpleNamespace(input_tokens=250, output_tokens=10),
+    )
+    provider = OpenAIProvider(
+        LlmSelection("openai", "gpt-6.2-sol"),
+        settings,
+        SimpleNamespace(responses=FakeResponses(response)),
+    )
+    session = LlmSession(
+        LlmSelection("openai", "gpt-6.2-sol"), settings=settings, provider=provider
+    )
+
+    with pytest.raises(LlmProviderError) as error:
+        session.generate("test")
+
+    assert error.value.category == "token_budget_exceeded"
+    assert error.value.usage["prompt_eval_count"] == 250
+    assert error.value.usage["eval_count"] == 10
+    assert session.input_tokens == 250
+    assert session.output_tokens == 10
 
 
 def test_readyz_remains_ready_for_ollama_only_without_openai_key(monkeypatch) -> None:

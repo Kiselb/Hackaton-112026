@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     agent_max_search_calls: int = Field(default=3, ge=1, le=10)
     agent_max_retries: int = Field(default=1, ge=0, le=3)
     agent_max_llm_calls: int = Field(default=4, ge=1, le=10)
+    agent_assessment_max_output_tokens: int = Field(default=2048, ge=128, le=8192)
+    agent_composition_max_output_tokens: int = Field(default=1024, ge=128, le=8192)
+    agent_validation_max_output_tokens: int = Field(default=512, ge=128, le=4096)
+    agent_context_window_tokens: int = Field(default=12288, ge=4096, le=131072)
     multi_query_enabled: bool = True
     multi_query_default_enabled: bool = False
     multi_query_max_variants: int = Field(default=2, ge=1, le=5)

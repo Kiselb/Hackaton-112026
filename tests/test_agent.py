@@ -4,7 +4,15 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from clip_agent.agent import AgentLimits, BoundedAgent, run_agent
+import pytest
+
+from clip_agent.agent import (
+    EVIDENCE_ASSESSMENT_SCHEMA,
+    AgentLimits,
+    BoundedAgent,
+    run_agent,
+)
+from clip_agent.llm import LlmProviderError
 
 
 def source(chunk_id: str = "chunk-1", text: str = "Подтверждённый факт.") -> dict[str, Any]:
@@ -30,6 +38,32 @@ def trace() -> dict[str, Any]:
         "status": "disabled",
         "latency_ms": 0.0,
         "fallback_reason": None,
+    }
+
+
+def assessment_payload(
+    *,
+    outcome: str = "answered",
+    aspect_id: str = "aspect-1",
+    source_ids: list[str] | None = None,
+    sufficient: bool = True,
+) -> dict[str, Any]:
+    ids = ["chunk-1"] if source_ids is None else source_ids
+    return {
+        "outcome": outcome,
+        "reason_code": "synthetic_assessment",
+        "clarification_question": "",
+        "conflicts": [],
+        "aspects": [
+            {
+                "aspect_id": aspect_id,
+                "sufficient": sufficient,
+                "source_ids": ids,
+                "reason": "synthetic reason",
+                "gap": "" if sufficient else "missing evidence",
+                "target_query": "" if sufficient else "targeted query",
+            }
+        ],
     }
 
 
@@ -85,6 +119,10 @@ class ScriptedLlm:
             if self.gap_first and self.assessments == 1:
                 return json.dumps(
                     {
+                        "outcome": "answered",
+                        "reason_code": "evidence_gap",
+                        "clarification_question": "",
+                        "conflicts": [],
                         "aspects": [
                             {
                                 "aspect_id": "a1",
@@ -96,9 +134,11 @@ class ScriptedLlm:
                             },
                             {
                                 "aspect_id": "a2",
-                                "sufficient": True,
-                                "source_ids": [source_id],
-                                "reason": "covered",
+                                "sufficient": bool(source_id),
+                                "source_ids": [source_id] if source_id else [],
+                                "reason": "covered" if source_id else "no evidence",
+                                "gap": "" if source_id else "missing evidence",
+                                "target_query": "" if source_id else "точечный запрос",
                             },
                         ]
                     }
@@ -106,12 +146,18 @@ class ScriptedLlm:
             aspect_ids = ["a1", "a2"] if '"a1"' in prompt else ["aspect-1"]
             return json.dumps(
                 {
+                    "outcome": "answered",
+                    "reason_code": "evidence_sufficient",
+                    "clarification_question": "",
+                    "conflicts": [],
                     "aspects": [
                         {
                             "aspect_id": aspect_id,
-                            "sufficient": True,
-                            "source_ids": [source_id],
-                            "reason": "covered",
+                            "sufficient": bool(source_id),
+                            "source_ids": [source_id] if source_id else [],
+                            "reason": "covered" if source_id else "no evidence",
+                            "gap": "" if source_id else "missing evidence",
+                            "target_query": "" if source_id else "точечный запрос",
                         }
                         for aspect_id in aspect_ids
                     ]
@@ -125,6 +171,22 @@ class ScriptedLlm:
         if "Черновик:" in prompt:
             return "Исправленный ответ [1].", usage
         return self.draft, usage
+
+
+class AssessmentOverrideLlm(ScriptedLlm):
+    def __init__(self, response: str | dict[str, Any]) -> None:
+        super().__init__()
+        self.response = response
+
+    def __call__(self, prompt: str):
+        if "Assess evidence" in prompt:
+            self.calls.append(prompt)
+            value = self.response
+            return (
+                json.dumps(value) if isinstance(value, dict) else value,
+                {"prompt_eval_count": 12, "eval_count": 7, "done_reason": "stop"},
+            )
+        return super().__call__(prompt)
 
 
 def agent(
@@ -161,6 +223,182 @@ def test_simple_route_skips_planner():
         "finish",
     ]
     assert state["outcome"] == "answered"
+
+
+def test_evidence_assessment_uses_schema_and_operation_output_budget():
+    class StructuredLlm(ScriptedLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.structured_calls: list[dict[str, Any]] = []
+
+        def generate(self, prompt: str, **kwargs):
+            self.structured_calls.append(kwargs)
+            return self(prompt)
+
+    llm = StructuredLlm()
+    runtime = BoundedAgent(
+        AgentLimits(),
+        retriever=Retriever(),
+        llm=llm,
+        assessment_max_output_tokens=777,
+    )
+
+    state = runtime.invoke("Какой лимит установлен?", "u", "s", "r")
+
+    assessment_call = next(
+        item for item in llm.structured_calls if item["schema_name"] == "evidence_assessment"
+    )
+    assert assessment_call["json_schema"]["type"] == EVIDENCE_ASSESSMENT_SCHEMA["type"]
+    aspect_schema = assessment_call["json_schema"]["properties"]["aspects"]["items"]
+    assert aspect_schema["properties"]["aspect_id"]["enum"] == ["aspect-1"]
+    assert aspect_schema["properties"]["source_ids"]["items"]["enum"] == [
+        "chunk-1"
+    ]
+    assert assessment_call["max_output_tokens"] == 777
+    assert state["outcome"] == "answered"
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_fragment"),
+    [
+        (assessment_payload(source_ids=["unknown-source"]), "unknown source_id"),
+        (assessment_payload(aspect_id="unknown-aspect"), "unknown aspect_id"),
+        (assessment_payload(outcome="unexpected"), "outcome is not allowed"),
+        (
+            {
+                **assessment_payload(),
+                "aspects": [
+                    {**assessment_payload()["aspects"][0], "sufficient": "true"}
+                ],
+            },
+            "must be boolean",
+        ),
+        (
+            {
+                **assessment_payload(),
+                "aspects": assessment_payload()["aspects"] * 2,
+            },
+            "duplicate aspect_id",
+        ),
+    ],
+)
+def test_invalid_evidence_assessment_semantics_fail_closed(payload, error_fragment):
+    state = agent(Retriever(), AssessmentOverrideLlm(payload)).invoke(
+        "Какой лимит установлен?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "technical_error"
+    assert state["reason_code"] == "evidence_assessment_failed"
+    assert any(error_fragment in item["error"] for item in state["errors"])
+
+
+@pytest.mark.parametrize("response", ["", '{"outcome":"answered"'])
+def test_empty_or_incomplete_evidence_assessment_fails_closed(response):
+    state = agent(Retriever(), AssessmentOverrideLlm(response)).invoke(
+        "Какой лимит установлен?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "technical_error"
+    event = next(item for item in state["trajectory"] if item["node"] == "assess_evidence")
+    assert event["structured_output"]["json_object_recognized"] is False
+    assert event["structured_output"]["rejection_reason"] in {
+        "empty_response",
+        "malformed_json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("category", "attempted", "reason_code"),
+    [
+        ("output_limit", True, "evidence_assessment_output_limit"),
+        ("token_budget_exceeded", False, "evidence_assessment_token_budget_exceeded"),
+        ("network", True, "evidence_assessment_failed"),
+    ],
+)
+def test_evidence_assessment_provider_failures_are_classified(
+    category, attempted, reason_code
+):
+    class FailingLlm:
+        def generate(self, prompt: str, **kwargs):
+            del kwargs
+            if "Assess evidence" in prompt:
+                raise LlmProviderError(
+                    category,
+                    "controlled provider error",
+                    attempted=attempted,
+                    usage={
+                        "prompt_eval_count": 20 if attempted else 0,
+                        "eval_count": 64 if attempted else 0,
+                        "done_reason": "length" if category == "output_limit" else None,
+                        "output_limit_reached": category == "output_limit",
+                        "max_output_tokens": 64,
+                    },
+                )
+            raise AssertionError("no other LLM call is allowed after assessment failure")
+
+    state = agent(Retriever(), FailingLlm()).invoke(
+        "Какой лимит установлен?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "technical_error"
+    assert state["reason_code"] == reason_code
+    assert state["llm_calls"] == int(attempted)
+    event = next(item for item in state["trajectory"] if item["node"] == "assess_evidence")
+    assert event["structured_output"]["rejection_reason"] == category
+    assert event["structured_output"]["output_limit_reached"] is (
+        category == "output_limit"
+    )
+
+
+def test_quality_review_required_is_preserved_without_answer_fallback():
+    payload = assessment_payload(
+        outcome="quality_review_required", source_ids=[], sufficient=False
+    )
+    state = agent(
+        Retriever(), AssessmentOverrideLlm(payload), retries=0
+    ).invoke("Какой лимит установлен?", "u", "s", "r")
+
+    assert state["outcome"] == "quality_review_required"
+    assert state["status"] == "abstained"
+    assert "службу качества" in state["answer"]
+
+
+def test_unconfirmed_conflict_is_rejected():
+    payload = assessment_payload(
+        outcome="conflict_detected", source_ids=["chunk-1", "chunk-2"]
+    )
+    payload["conflicts"] = [
+        {
+            "source_ids": ["chunk-1", "chunk-2"],
+            "summary": "Документы содержат разные сведения.",
+        }
+    ]
+
+    class TwoGenericSources:
+        def __call__(self, query: str, limit: int | None):
+            return [source("chunk-1"), source("chunk-2")], 2, trace()
+
+    state = agent(TwoGenericSources(), AssessmentOverrideLlm(payload)).invoke(
+        "Какой срок установлен?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "technical_error"
+    assert any("not confirmed" in item["error"] for item in state["errors"])
+
+
+def test_assessment_trace_keeps_safe_structured_diagnostics():
+    state = agent(Retriever(), ScriptedLlm()).invoke(
+        "Какой лимит установлен?", "u", "s", "r"
+    )
+    event = next(item for item in state["trajectory"] if item["node"] == "assess_evidence")
+    diagnostics = event["structured_output"]
+
+    assert diagnostics["operation"] == "evidence_assessment"
+    assert diagnostics["json_schema_requested"] is True
+    assert diagnostics["json_object_recognized"] is True
+    assert diagnostics["rejection_reason"] is None
+    assert "content" not in diagnostics
+    assert event["evidence_count"] == 1
 
 
 def test_multi_query_expands_simple_question_and_preserves_grounding_budget():
@@ -272,7 +510,7 @@ def test_multi_aspect_plan_preserves_original_question():
 
 def test_gap_triggers_targeted_retrieval_and_second_assessment():
     retriever, llm = Retriever(), ScriptedLlm(gap_first=True)
-    state = agent(retriever, llm).invoke(
+    state = agent(retriever, llm, llm_calls=5).invoke(
         "Чем отличаются первый и второй лимиты?", "u", "s", "r"
     )
 
@@ -284,7 +522,7 @@ def test_gap_triggers_targeted_retrieval_and_second_assessment():
 
 
 def test_budgets_are_strict_and_graph_finishes_without_unbounded_cycle():
-    retriever, llm = Retriever(empty_first=True), ScriptedLlm(gap_first=True)
+    retriever, llm = Retriever(empty_first=True), ScriptedLlm()
     state = agent(
         retriever, llm, search_calls=1, retries=0, llm_calls=1
     ).invoke("Какой лимит установлен?", "u", "s", "r")
@@ -579,6 +817,8 @@ def test_real_source_ambiguity_returns_specific_clarification():
                                 "sufficient": True,
                                 "source_ids": ["presale", "delivery"],
                                 "reason": "different process scopes",
+                                "gap": "",
+                                "target_query": "",
                             }
                         ],
                     }
@@ -592,10 +832,36 @@ def test_real_source_ambiguity_returns_specific_clarification():
     assert state["llm_calls"] == 1
 
 
+def test_semantic_validation_catches_unscoped_role_ambiguity() -> None:
+    class TwoAppointmentSources:
+        def __call__(self, query: str, limit: int | None):
+            return [
+                source("infosec", "Координатор департамента назначает РП проекта."),
+                source(
+                    "technical",
+                    "Руководитель отдела управления проектами назначает РП проекта.",
+                ),
+            ], 2, trace()
+
+    llm = AssessmentOverrideLlm(
+        assessment_payload(source_ids=["infosec"], outcome="answered")
+    )
+    state = agent(TwoAppointmentSources(), llm).invoke(
+        "Кто назначает РП?", "u", "s", "r"
+    )
+
+    assert state["outcome"] == "clarification_required"
+    assert "подразделение и этап" in state["answer"]
+    assert state["llm_calls"] == 1
+
+
 def test_two_source_conflict_is_reported_without_choosing_priority():
     class TwoSources:
         def __call__(self, query: str, limit: int | None):
-            return [source("rule-a"), source("rule-b")], 2, trace()
+            return [
+                source("rule-a", "Срок исполнения задачи составляет 5 рабочих дней."),
+                source("rule-b", "Срок исполнения задачи составляет 10 рабочих дней."),
+            ], 2, trace()
 
     class ConflictLlm(ScriptedLlm):
         def __call__(self, prompt: str):
@@ -618,6 +884,8 @@ def test_two_source_conflict_is_reported_without_choosing_priority():
                                 "sufficient": True,
                                 "source_ids": ["rule-a", "rule-b"],
                                 "reason": "conflict",
+                                "gap": "",
+                                "target_query": "",
                             }
                         ],
                     }

@@ -80,6 +80,8 @@ def test_grounding_validator_accepts_valid_result_with_empty_violation_lists():
     )
     assert "valid citation number alone is insufficient" in prompt
     assert "scope (department, process, stage and conditions)" in prompt
+    assert "сделкам направления Альфа" in prompt
+    assert "договорам отдела продаж" not in prompt
     valid, failures = parse_grounding_validation(
         '{"valid":true,"unsupported_claims":[],"scope_errors":[]}'
     )

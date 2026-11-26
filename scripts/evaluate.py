@@ -344,6 +344,10 @@ def _combined_metrics(*payloads: dict[str, Any]) -> dict[str, Any]:
         "llm_calls",
         "agent_steps",
         "multi_query_search_calls",
+        "assessment_latency_ms",
+        "assessment_malformed_responses",
+        "assessment_empty_responses",
+        "assessment_truncated_responses",
     ):
         values = [item.get(key) for item in metrics if item.get(key) is not None]
         summed[key] = sum(values) if values else None
@@ -359,6 +363,36 @@ def _combined_metrics(*payloads: dict[str, Any]) -> dict[str, Any]:
             }
         )
     return summed
+
+
+def _assessment_trace_metrics(client: Any, trace_ids: list[str | None]) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    for trace_id in trace_ids:
+        if not trace_id:
+            continue
+        response = client.get(f"/api/v1/admin/traces/{trace_id}")
+        response.raise_for_status()
+        details = response.json().get("details", {})
+        events.extend(
+            event
+            for event in details.get("trajectory", [])
+            if event.get("node") == "assess_evidence"
+        )
+    diagnostics = [event.get("structured_output", {}) for event in events]
+    return {
+        "assessment_latency_ms": round(
+            sum(float(event.get("latency_ms") or 0) for event in events), 4
+        ),
+        "assessment_malformed_responses": sum(
+            item.get("rejection_reason") == "malformed_json" for item in diagnostics
+        ),
+        "assessment_empty_responses": sum(
+            item.get("rejection_reason") == "empty_response" for item in diagnostics
+        ),
+        "assessment_truncated_responses": sum(
+            bool(item.get("output_limit_reached")) for item in diagnostics
+        ),
+    }
 
 
 def execute_case(
@@ -378,6 +412,9 @@ def execute_case(
     initial_response = client.post("/api/v1/ask", json=request)
     initial_response.raise_for_status()
     initial = initial_response.json()
+    initial.setdefault("metrics", {}).update(
+        _assessment_trace_metrics(client, [initial.get("trace_id")])
+    )
     dialogue_spec = case.get("dialogue")
     if not dialogue_spec:
         return initial
@@ -411,6 +448,9 @@ def execute_case(
     )
     follow_up_response.raise_for_status()
     final = follow_up_response.json()
+    final.setdefault("metrics", {}).update(
+        _assessment_trace_metrics(client, [final.get("trace_id")])
+    )
     final["metrics"] = _combined_metrics(initial, final)
     final["dialogue"] = {
         **dialogue,
@@ -630,6 +670,16 @@ def evaluate(args: argparse.Namespace) -> int:
             "max_search_calls": settings.agent_max_search_calls,
             "max_retries": settings.agent_max_retries,
             "max_llm_calls": settings.agent_max_llm_calls,
+            "assessment_max_output_tokens": (
+                settings.agent_assessment_max_output_tokens
+            ),
+            "composition_max_output_tokens": (
+                settings.agent_composition_max_output_tokens
+            ),
+            "validation_max_output_tokens": (
+                settings.agent_validation_max_output_tokens
+            ),
+            "context_window_tokens": settings.agent_context_window_tokens,
             "multi_query_requested": args.multi_query,
             "multi_query_max_variants": settings.multi_query_max_variants,
         },

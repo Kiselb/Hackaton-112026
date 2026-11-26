@@ -158,3 +158,132 @@ Latency/tokens CLIP-016 были синтетическими значениям
 - Следующий измеримый шаг: эксперт утверждает review-файлы; затем исправляется JSON-contract агента, фиксируется новая версия кода и повторяются минимум три контрольных прогона на неизменных dataset/corpus hashes.
 
 Исторические результаты CLIP-003/005/006/016 остаются синтетическими и не смешиваются с этой таблицей.
+
+---
+
+## CLIP-017-FIX — Structured Evidence Assessment Repair
+
+### 11. Подтверждённая первопричина
+
+Исправление выполнено от базового commit `47e8b2006c3a3ab746452d658f35091b7afb9600`. Были изучены исходные локальные артефакты A/B/C и сохранённые traces. Зафиксированные ранее 64 ответа без JSON object и 3 синтаксически повреждённых JSON подтверждены case-level артефактами. Причина оказалась составной:
+
+1. `assess_evidence` просил JSON только текстовой инструкцией, но не передавал уже поддерживаемый provider adapter параметр `json_schema`;
+2. общий `OLLAMA_NUM_PREDICT=512` применялся к assessment без отдельного operation budget; 25 ответов B/C имели длину ровно 512 output tokens;
+3. часть `done_reason=length` возникала не только из-за `num_predict`, но и при исчерпании прежнего контекстного окна Ollama около 4096 токенов: сумма большого evidence prompt и ответа достигала границы контекста;
+4. повторные assessment/composition/validation передавали крупный evidence context и могли исчерпать общий `LLM_MAX_TOTAL_TOKENS_PER_REQUEST=12000`;
+5. adapter не различал завершённый и оборванный schema-constrained ответ по `done_reason`, а trace не содержал достаточной безопасной диагностики операции.
+
+Свободный текст, пустые ответы и повреждённый JSON были следствиями отсутствующего structured contract и неверно распределённого operation/context budget, а не одной только ошибки parser. Влияние planner, targeted retry и Multi-Query также подтверждено калибровочными прогонами: дополнительный вызов и увеличенный evidence set повышают расход, поэтому assessment retry разрешён только при сохранении бюджета composition и обязательной grounding validation.
+
+### 12. Реализованное исправление
+
+- Добавлен строгий `EVIDENCE_ASSESSMENT_SCHEMA`: фиксированные обязательные поля, enum outcome, запрет дополнительных полей, ограничения массивов/строк. Для конкретного вызова schema дополнительно ограничивает `aspect_id` фактическим планом, `source_id` фактическим evidence и точным числом аспектов.
+- `assess_evidence` вызывает существующий `LlmSession` со schema name `evidence_assessment`; второй механизм LLM-вызовов не создавался.
+- После JSON Schema выполняется отдельная семантическая проверка: неизвестные/повторные аспекты и источники, типы, пропущенные аспекты, безопасное уточнение и неподтверждённый conflict отклоняются. Conflict не принимается без детерминированного признака несовместимых числовых или полярных положений.
+- Для короткого вопроса о назначении роли добавлена консервативная evidence-backed проверка области применения: уточнение формируется только если назначения найдены минимум в двух документах, а подразделение/этап отсутствуют в вопросе. Это позволило выполнить двухходовый `REAL-022`, не создавая уточнение без evidence.
+- Ollama получает JSON Schema через `format`, operation-specific `num_predict` и `num_ctx`. OpenAI Responses получает strict `json_schema` и operation-specific `max_output_tokens`. Внешний OpenAI API не вызывался.
+- Для schema-constrained операций `done_reason=length` классифицируется как `output_limit`, и неполный JSON не передаётся parser. Для обычного Baseline-текста сохранена прежняя совместимость; факт достижения лимита остаётся в telemetry как `output_limit_reached=true`.
+- Usage не теряется при provider error или превышении общего token budget. Citation repair выполняется только при наличии бюджета для него и обязательного валидатора. Grounding validator получает только фактически процитированные evidence chunks с исходными номерами ссылок; сама semantic validation не отключена.
+- Trace содержит только безопасные структурированные поля: operation, provider/model, input/output tokens, `done_reason`, длину ответа, schema/json status, rejection reason, output limit, context window и число попыток. Полные prompt/response с документами не логируются.
+- Evaluation lab теперь агрегирует assessment latency и числа malformed/empty/truncated responses, а также `technical_error_rate`. Публичный FastAPI contract не менялся.
+
+Фактические process/config параметры контрольных прогонов:
+
+| Параметр | Значение |
+|---|---:|
+| Ollama model | `qwen3.5:9b` |
+| `temperature` / `think` | `0` / `false` |
+| Глобальный `OLLAMA_NUM_PREDICT` / planner | 512 |
+| Assessment max output | 2048 |
+| Composition max output | 1024 |
+| Grounding validation max output | 512 |
+| Agent context window | 12288 |
+| Общий token budget на один запрос | 12000 |
+| `AGENT_MAX_LLM_CALLS` / retries / search calls | 4 / 1 / 3 |
+| Reranker | OFF |
+
+Глобальный `OLLAMA_NUM_PREDICT` и действующий `.env` не изменялись. Новые настройки добавлены в `config.py` и `.env.example`; адреса сервисов и секреты не зашивались.
+
+### 13. Контрольные A2/B2/C2
+
+Использованы те же 36 draft-gold кейсов и четыре DOCX. Dataset SHA-256 остался `9f089d7c49c3839291ee8014fd534dedf630d9c0f03c5d3cf012f781b245bc59`, corpus SHA-256 — `f23a62712eab8f4aeeae1d49e8e4235020d1f615c22290e77cb3808e9d0861b5`. Manifest совпал, corpus был переиспользован без повторной индексации. Все три финальных прогона имеют одинаковый source tree SHA-256 `7ec98c8fe53aa65e8245d3d6601809e5cef2c4fe3ac88cfe1758965fe2f4a8e3` и `dirty=true`, поскольку единый commit создаётся после записи отчёта.
+
+| Обозначение | Режим | Experiment ID |
+|---|---|---|
+| A2 | Baseline RAG | `clip017_customer_v1-20261126T204730+0300-47e8b200-7ec98c8f` |
+| B2 | Strict Agent, Multi-Query OFF | `clip017_customer_v1-20261126T205003+0300-47e8b200-7ec98c8f` |
+| C2 | Strict Agent, Multi-Query ON | `clip017_customer_v1-20261126T205320+0300-47e8b200-7ec98c8f` |
+
+#### Retrieval
+
+| Метрика | A2 | B2 MQ OFF | C2 MQ ON | C2 − B2 |
+|---|---:|---:|---:|---:|
+| Document Recall@1 | 0,6389 | 0,6389 | 0,5722 | −0,0667 |
+| Document Recall@3 | 0,9056 | 0,9056 | 0,9389 | +0,0333 |
+| Document Precision@3 | 0,3889 | 0,3889 | 0,4000 | +0,0111 |
+| Document MRR | 0,8472 | 0,8472 | 0,8167 | −0,0305 |
+| nDCG@3 | 0,8377 | 0,8377 | 0,8297 | −0,0080 |
+| Passage Recall@1 | 0,5167 | 0,5167 | 0,4167 | −0,1000 |
+| Passage Recall@3 | 0,6333 | 0,6333 | 0,5778 | −0,0555 |
+| Passage Recall@5 | 0,6611 | 0,6611 | 0,6722 | +0,0111 |
+| Passage Recall@8 | 0,7556 | 0,7556 | 0,7889 | +0,0333 |
+| Passage Precision@5 | 0,2267 | 0,2333 | 0,2533 | +0,0200 |
+
+Retrieval B2/C2 воспроизводит прежние B/C значения с ожидаемым небольшим отличием B2 Passage Precision@5 из-за фактического количества возвращённых slots. Исправление не меняло межзапросный RRF, дедупликацию или provenance.
+
+#### Outcomes, grounding и assessment stability
+
+| Метрика | A2 | B исходный | B2 | C исходный | C2 |
+|---|---:|---:|---:|---:|---:|
+| Technical errors | 0/36 | 34/36 | 2/36 | 33/36 | 2/36 |
+| Technical error rate | 0,0000 | 0,9444 | 0,0556 | 0,9167 | 0,0556 |
+| Outcome accuracy | 0,7500 | 0,0556 | 0,7500 | 0,0556 | 0,8056 |
+| Grounded answer rate | 0,4333 | 0,0000 | 0,5000 | 0,0000 | 0,4333 |
+| Citation ID validity | 0,8611 | 0,0556 | 0,8889 | 0,0833 | 0,9444 |
+| Citation support proxy | 0,4770 | 0,0172 | 0,5805 | 0,0000 | 0,5632 |
+| Required facts coverage | 0,5778 | 0,0167 | 0,5444 | 0,0000 | 0,5444 |
+| Correct abstention | 0,1667 | 0,0000 | 0,3333 | 0,1667 | 0,5000 |
+| Clarification success | 0,0000 | 0,0000 | 0,1667 | 0,0000 | 0,1667 |
+| Assessment malformed | 0 | 64 случаев B+C без JSON object* | 0 | 3 повреждённых JSON C* | 0 |
+| Assessment empty | 0 | NOT MEASURED отдельно | 0 | NOT MEASURED отдельно | 0 |
+| Assessment truncated | 0 | NOT MEASURED отдельно | 0 | NOT MEASURED отдельно | 0 |
+
+`*` Исходные 64 + 3 относятся к совокупному разбору B/C и не могут быть корректно разложены по строкам таблицы как независимые метрики каждого режима. Они сохранены здесь в историческом виде. Во всех зарегистрированных assessment diagnostics B2/C2 распознан JSON object, а malformed/empty/truncated равны `0/0/0` в каждом 36-кейсном прогоне.
+
+Две технические ошибки B2 (`REAL-029`, `REAL-031`) и две C2 (`REAL-028`, `REAL-029`) не являются ошибками JSON parsing или output truncation. JSON был распознан, `done_reason=stop`, но консервативная semantic validation отклонила небезопасное решение модели (`semantic_validation_failed`) на вопросах, сведения для которых отсутствуют в корпусе. Автоматическое превращение этих ошибок в `answered` или `quality_review_required` не добавлялось, чтобы не скрывать техническую причину.
+
+#### Производительность
+
+| Показатель | A2 | B2 MQ OFF | C2 MQ ON |
+|---|---:|---:|---:|
+| Latency mean, мс | 3 596,9 | 5 053,4 | 6 461,9 |
+| Latency median, мс | 3 086,5 | 4 574,5 | 6 104,0 |
+| Latency p95, мс | 7 366 | 8 444 | 9 531 |
+| Input tokens total | 196 202 | 317 586 | 338 631 |
+| Output tokens total | 9 344 | 12 723 | 17 201 |
+| LLM calls total | 41 | 97 | 142 |
+| Search calls total | 31 | 38 | 61 |
+| Assessment latency mean, мс | N/A | 2 851,1 | 3 061,8 |
+| Assessment latency total, мс | N/A | 102 640,8 | 110 224,5 |
+
+Нельзя трактовать увеличение latency как ухудшение самого исправления: исходные B/C часто завершались ранним техническим отказом и не выполняли composition/validation. C2 дороже B2 на 23 поиска, 45 LLM-вызовов и примерно 1,41 секунды средней latency; преимущества Multi-Query для итоговых фактов остаются неоднозначными.
+
+### 14. Ключевые реальные сценарии
+
+- `REAL-001`: B2 и C2 — `answered`, required facts coverage `1,0`, grounded answer `true`, допустимые citations. Массовый `evidence_assessment_failed` устранён.
+- `REAL-022`: B2 и C2 выполнили полный двухходовый диалог. Первый ход — `clarification_required` с вопросом о подразделении и этапе; ответ пользователя включён в resolved query; второй retrieval завершился `answered`. Clarification success `true`, required facts coverage `1,0`. B2 прошёл grounded proxy; C2 сохранил факты и ссылки, но автоматический grounding proxy отклонил расширенный текст, поэтому требуется ручная проверка.
+- `REAL-026`: C2 нашёл дополнительное положение и вернул `answered`, тогда как B2 безопасно завершился `quality_review_required`. Однако required facts coverage C2 остаётся `0`, а grounded proxy — `false`; преимущество retrieval не превратилось в доказанное улучшение итогового ответа.
+- `REAL-033`: C2 корректно вернул `quality_review_required` и не вывел автоматическую отмену документов. B2 запросил уточнение вместо ожидаемой эскалации, поэтому safe behavior сохранён, но outcome не совпал с draft gold.
+- Отдельный smoke-вопрос «Каков порядок компенсации питания сотрудникам?» завершился HTTP 200 с `quality_review_required`, `reason_code=answer_validation_failed`; неподтверждённый ответ не был опубликован. Найденные 8 retrieval chunks нерелевантны вопросу, что дополнительно показывает необходимость semantic gate.
+
+### 15. Остаточные дефекты, ограничения и готовность
+
+1. Основной дефект structured output исправлен: массовые parse/truncation failures устранены, но Strict Agent ещё имеет 2/36 технических semantic-validation отказа в каждом режиме. По критериям задания задача не объявляется полностью успешной.
+2. Clarification success вырос с 0/6 до 1/6. `REAL-022` доказан end-to-end, но остальные draft-сценарии уточнения не прошли агрегатный критерий.
+3. Correct abstention остаётся 2/6 в B2 и 3/6 в C2. Нельзя считать строгую обработку всех вопросов без ответа завершённой.
+4. `REAL-020` после сокращения composition prompt укладывается в общий token budget и больше не даёт technical error, но required-facts proxy не подтверждает все три требуемых положения.
+5. B2/C2 не превысили `AGENT_MAX_LLM_CALLS`; retry assessment резервирует composition и validation. Общий token budget остаётся 12000 на один HTTP-запрос. Двухходовый диалог учитывается как два отдельных запроса, а агрегированное число токенов кейса может быть больше 12000.
+6. Все 36 gold-кейсов имеют `draft` и требуют независимого expert review. Regex/proxy метрики не доказывают юридическую или фактическую корректность текста.
+7. Подтверждённых реальных конфликтов в корпусе нет, поэтому positive conflict handling остаётся `NOT MEASURED` на реальных документах; fail-closed поведение покрыто unit tests.
+
+**Рекомендация:** Strict Agent больше не заблокирован массовой ошибкой Evidence Assessment и пригоден для ограниченной внутренней демонстрации с наблюдением traces и явным предупреждением о draft gold. Делать его безусловным production/default режимом пока рано: сначала нужно устранить остаточные semantic-validation technical errors, повысить correct abstention и пройти ручной review ответов `REAL-020`, `REAL-022`, `REAL-026`, `REAL-028/029/031/033`. Multi-Query следует показывать как экспериментальный режим, а не как доказанное улучшение качества.

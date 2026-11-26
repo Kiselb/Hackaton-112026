@@ -123,8 +123,11 @@ class OllamaProvider:
         *,
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "structured_response",
+        max_output_tokens: int | None = None,
+        context_window_tokens: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
         del schema_name
+        output_limit = max_output_tokens or self.settings.ollama_num_predict
         payload: dict[str, Any] = {
             "model": self.selection.model,
             "stream": False,
@@ -132,11 +135,13 @@ class OllamaProvider:
             "messages": [{"role": "user", "content": prompt}],
             "options": {
                 "temperature": self.settings.ollama_temperature,
-                "num_predict": self.settings.ollama_num_predict,
+                "num_predict": output_limit,
             },
         }
         if json_schema is not None:
             payload["format"] = json_schema
+        if context_window_tokens is not None:
+            payload["options"]["num_ctx"] = context_window_tokens
         started = time.perf_counter()
         try:
             response = httpx.post(
@@ -156,14 +161,30 @@ class OllamaProvider:
             raise LlmProviderError(category, "LLM-провайдер отклонил запрос.") from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise LlmProviderError("malformed_response", "LLM-провайдер вернул неверный ответ.") from exc
-        if not content:
-            raise LlmProviderError("empty_response", "LLM-провайдер не вернул итоговый текст.")
-        return content, {
+        normalized = {
             **usage,
             "provider": self.selection.provider,
             "model": self.selection.model,
             "provider_latency_ms": round((time.perf_counter() - started) * 1000, 3),
+            "response_chars": len(content),
+            "json_schema_requested": json_schema is not None,
+            "max_output_tokens": output_limit,
+            "context_window_tokens": context_window_tokens,
+            "output_limit_reached": usage.get("done_reason") == "length",
         }
+        if normalized["output_limit_reached"] and json_schema is not None:
+            raise LlmProviderError(
+                "output_limit",
+                "Ollama остановил генерацию по лимиту output tokens.",
+                usage=normalized,
+            )
+        if not content:
+            raise LlmProviderError(
+                "empty_response",
+                "LLM-провайдер не вернул итоговый текст.",
+                usage=normalized,
+            )
+        return content, normalized
 
 
 class OpenAIProvider:
@@ -221,12 +242,16 @@ class OpenAIProvider:
         *,
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "structured_response",
+        max_output_tokens: int | None = None,
+        context_window_tokens: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        del context_window_tokens
+        output_limit = max_output_tokens or self.settings.openai_max_output_tokens
         request: dict[str, Any] = {
             "model": self.selection.model,
             "input": prompt,
             "store": False,
-            "max_output_tokens": self.settings.openai_max_output_tokens,
+            "max_output_tokens": output_limit,
             "reasoning": {"effort": self.settings.openai_reasoning_effort},
         }
         if json_schema is not None:
@@ -253,6 +278,10 @@ class OpenAIProvider:
             "provider": self.selection.provider,
             "model": self.selection.model,
             "provider_latency_ms": round((time.perf_counter() - started) * 1000, 3),
+            "response_chars": len(str(getattr(response, "output_text", "") or "").strip()),
+            "json_schema_requested": json_schema is not None,
+            "max_output_tokens": output_limit,
+            "output_limit_reached": False,
         }
         if self._contains_refusal(response):
             raise LlmProviderError(
@@ -262,6 +291,7 @@ class OpenAIProvider:
             details = getattr(response, "incomplete_details", None)
             reason = getattr(details, "reason", None)
             category = "output_limit" if reason == "max_output_tokens" else "incomplete_response"
+            normalized["output_limit_reached"] = category == "output_limit"
             raise LlmProviderError(
                 category, "OpenAI вернул незавершённый ответ.", usage=normalized
             )
@@ -304,18 +334,35 @@ class LlmSession:
         *,
         json_schema: dict[str, Any] | None = None,
         schema_name: str = "structured_response",
+        max_output_tokens: int | None = None,
+        context_window_tokens: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        if self.input_tokens + self.output_tokens >= self.settings.llm_max_total_tokens_per_request:
+        remaining = (
+            self.settings.llm_max_total_tokens_per_request
+            - self.input_tokens
+            - self.output_tokens
+        )
+        if remaining <= 0:
             self.last_error_category = "token_budget_exceeded"
             raise LlmProviderError(
                 "token_budget_exceeded",
                 "Лимит токенов для одного запроса исчерпан.",
                 attempted=False,
             )
+        provider_default = (
+            self.settings.openai_max_output_tokens
+            if self.selection.provider == "openai"
+            else self.settings.ollama_num_predict
+        )
+        effective_output_limit = min(max_output_tokens or provider_default, remaining)
         self.calls += 1
         try:
             content, usage = self.provider.generate(
-                prompt, json_schema=json_schema, schema_name=schema_name
+                prompt,
+                json_schema=json_schema,
+                schema_name=schema_name,
+                max_output_tokens=effective_output_limit,
+                context_window_tokens=context_window_tokens,
             )
         except LlmProviderError as exc:
             self.input_tokens += int(exc.usage.get("prompt_eval_count") or 0)
@@ -329,7 +376,9 @@ class LlmSession:
         if self.input_tokens + self.output_tokens > self.settings.llm_max_total_tokens_per_request:
             self.last_error_category = "token_budget_exceeded"
             raise LlmProviderError(
-                "token_budget_exceeded", "Лимит токенов для одного запроса превышен."
+                "token_budget_exceeded",
+                "Лимит токенов для одного запроса превышен.",
+                usage=usage,
             )
         return content, usage
 
