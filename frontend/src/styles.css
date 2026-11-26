@@ -41,6 +41,7 @@ footer { margin-top: 2rem; border-top: 1px solid #d4ddd7; padding-top: 1rem; col
 textarea { min-height: 115px; resize: vertical; border: 1px solid #b8c8bf; border-radius: 9px; padding: .85rem; color: inherit; background: #fbfcfb; }
 textarea:focus, input:focus, select:focus { outline: 3px solid #85bca73d; border-color: #40836a; }
 .mode-select, .filter-grid label { display: grid; gap: .3rem; color: #5a6b64; font-size: .78rem; font-weight: 700; }
+.request-controls { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: end; gap: .55rem; }
 select, input { border: 1px solid #bcc9c2; border-radius: 8px; padding: .62rem .7rem; background: #fff; color: #253b33; }
 .mode { display: inline-flex; align-items: center; width: max-content; border-radius: 999px; padding: .32rem .6rem; font-size: .72rem; font-weight: 800; white-space: nowrap; }
 .mode-baseline { background: #e9eef7; color: #3c526f; }
@@ -143,6 +144,7 @@ pre { overflow: auto; max-height: 340px; border-radius: 8px; padding: .75rem; ba
   .timeline summary { grid-template-columns: 1fr; }
   .upload { grid-template-columns: 1fr; }
   .registry > div, .form-heading, .answer-header, .trace-heading { align-items: stretch; flex-direction: column; }
+  .request-controls { justify-content: flex-start; }
 }
 @media (max-width: 440px) {
   .metric-grid, .filter-grid { grid-template-columns: 1fr; }

@@ -6,10 +6,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, TypedDict
 
-import httpx
 from langgraph.graph import END, START, StateGraph
 
 from .answering import (
+    GROUNDING_VALIDATION_SCHEMA,
     build_answer_prompt,
     build_citation_repair_prompt,
     build_grounding_validation_prompt,
@@ -20,12 +20,33 @@ from .answering import (
 )
 from .config import Settings, get_settings
 from .guardrails import assess_input, prompt_evidence_text, sanitize_document_text
+from .llm import LlmSession, create_llm_session, resolve_llm_selection
 from .search import retrieve
 
 
 Retriever = Callable[[str, int | None], tuple[list[dict[str, Any]], int, dict[str, Any]]]
 LlmCaller = Callable[[str], tuple[str, dict[str, Any]]]
 
+PLANNER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "aspects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "aspect_id": {"type": "string"},
+                    "question": {"type": "string"},
+                },
+                "required": ["aspect_id", "question"],
+                "additionalProperties": False,
+            },
+        },
+        "search_queries": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["aspects", "search_queries"],
+    "additionalProperties": False,
+}
 
 class AgentState(TypedDict, total=False):
     request_id: str
@@ -66,29 +87,9 @@ class AgentLimits:
 
 
 def call_ollama(prompt: str) -> tuple[str, dict[str, Any]]:
-    settings = get_settings()
-    response = httpx.post(
-        f"{settings.ollama_url}/api/chat",
-        json={
-            "model": settings.ollama_model,
-            "stream": False,
-            "think": settings.ollama_think,
-            "messages": [{"role": "user", "content": prompt}],
-            "options": {
-                "temperature": settings.ollama_temperature,
-                "num_predict": settings.ollama_num_predict,
-            },
-        },
-        timeout=300,
-    )
-    response.raise_for_status()
-    usage = response.json()
-    content = usage["message"]["content"].strip()
-    if not content:
-        raise RuntimeError(
-            f"Ollama returned an empty answer (done_reason={usage.get('done_reason')!r})"
-        )
-    return content, usage
+    configured = get_settings()
+    selection = resolve_llm_selection("ollama", configured.ollama_model, settings=configured)
+    return create_llm_session(selection, settings=configured).generate(prompt)
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:
@@ -289,7 +290,12 @@ class BoundedAgent:
         }
 
     def _call(
-        self, state: AgentState, prompt: str
+        self,
+        state: AgentState,
+        prompt: str,
+        *,
+        json_schema: dict[str, Any] | None = None,
+        schema_name: str = "structured_response",
     ) -> tuple[str | None, dict[str, Any], dict[str, Any] | None]:
         if state.get("llm_calls", 0) >= self.limits.max_llm_calls:
             return None, {}, {
@@ -298,10 +304,20 @@ class BoundedAgent:
                 "attempted": False,
             }
         try:
-            content, usage = self.llm(prompt)
+            if hasattr(self.llm, "generate"):
+                content, usage = self.llm.generate(
+                    prompt, json_schema=json_schema, schema_name=schema_name
+                )
+            else:
+                content, usage = self.llm(prompt)
             return content, usage, None
         except Exception as exc:
-            return None, {}, {"node": "llm", "error": str(exc), "attempted": True}
+            return None, {}, {
+                "node": "llm",
+                "error": str(exc),
+                "category": getattr(exc, "category", "provider_error"),
+                "attempted": getattr(exc, "attempted", True),
+            }
 
     def route_and_plan(self, state: AgentState) -> dict[str, Any]:
         started = time.perf_counter()
@@ -322,7 +338,9 @@ class BoundedAgent:
             '{"aspects":[{"aspect_id":"aspect-1","question":"..."}],'
             '"search_queries":["..."]}. Question: ' + question
         )
-        content, usage, error = self._call(state, prompt)
+        content, usage, error = self._call(
+            state, prompt, json_schema=PLANNER_SCHEMA, schema_name="agent_plan"
+        )
         llm_calls = state.get("llm_calls", 0) + int(
             error is None or error.get("attempted", True)
         )
@@ -775,6 +793,7 @@ class BoundedAgent:
             retries += int(error is None or error.get("attempted", True))
             if error:
                 errors.append({"node": "validate_answer", "error": error["error"]})
+                llm_failures = ["citation_repair_provider_error"]
             if content:
                 answer = content
                 citation_valid = citation_ids_admissible(answer, len(evidence))
@@ -787,6 +806,8 @@ class BoundedAgent:
             content, usage, error = self._call(
                 state,
                 build_grounding_validation_prompt(state["question"], answer, evidence),
+                json_schema=GROUNDING_VALIDATION_SCHEMA,
+                schema_name="grounding_validation",
             )
             llm_calls += int(error is None or error.get("attempted", True))
             if error:
@@ -813,7 +834,8 @@ class BoundedAgent:
         ]
         if failures:
             technical_validation_failure = any(
-                failure.startswith("grounding_validator_") for failure in failures
+                failure.startswith(("grounding_validator_", "citation_repair_provider_"))
+                for failure in failures
             )
             if technical_validation_failure:
                 answer = (
@@ -924,14 +946,20 @@ class BoundedAgent:
         return self.graph.invoke(initial, {"recursion_limit": 20})
 
 
-def agent_from_settings(settings: Settings | None = None) -> BoundedAgent:
+def agent_from_settings(
+    settings: Settings | None = None, *, llm: LlmCaller | LlmSession | None = None
+) -> BoundedAgent:
     configured = settings or get_settings()
+    if llm is None:
+        selection = resolve_llm_selection(None, None, settings=configured)
+        llm = create_llm_session(selection, settings=configured)
     return BoundedAgent(
         AgentLimits(
             max_search_calls=configured.agent_max_search_calls,
             max_retries=configured.agent_max_retries,
             max_llm_calls=configured.agent_max_llm_calls,
-        )
+        ),
+        llm=llm,
     )
 
 
@@ -942,8 +970,13 @@ def run_agent(
     request_id: str,
     *,
     agent: BoundedAgent | None = None,
+    llm: LlmCaller | LlmSession | None = None,
 ) -> dict[str, Any]:
-    runtime = agent or agent_from_settings()
+    if agent is None and llm is None:
+        configured = get_settings()
+        selection = resolve_llm_selection(None, None, settings=configured)
+        llm = create_llm_session(selection, settings=configured)
+    runtime = agent or agent_from_settings(llm=llm)
     state = runtime.invoke(question, user_id, session_id, request_id)
     retrieval_runs = state.get("retrieval_runs", [])
     rerank_latencies = [
@@ -1011,5 +1044,6 @@ def run_agent(
                 "max_llm_calls": runtime.limits.max_llm_calls,
             },
             "retrieval": retrieval_trace,
+            **(llm.summary() if isinstance(llm, LlmSession) else {}),
         },
     }

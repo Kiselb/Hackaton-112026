@@ -1,7 +1,7 @@
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -14,12 +14,13 @@ from sqlalchemy.orm import Session
 from .agent import run_agent
 from .analytics import FEEDBACK_RATINGS, aggregate_traces, classify_trace, trace_mode
 from .answering import (
+    GROUNDING_VALIDATION_SCHEMA,
     build_answer_prompt,
     build_citation_repair_prompt,
     build_grounding_validation_prompt,
     build_temporal_abstention,
     citation_ids_admissible,
-    merge_ollama_usage,
+    merge_llm_usage,
     parse_grounding_validation,
     requires_temporal_abstention,
 )
@@ -29,6 +30,15 @@ from .db import Chunk, Document, SearchTrace, SessionLocal, TraceFeedback, init_
 from .extract import extract_text
 from .guardrails import assess_input
 from .load_control import RequestGate, slot_dependency
+from .llm import (
+    LlmProviderError,
+    LlmSelectionError,
+    LlmSession,
+    create_llm_session,
+    llm_capabilities,
+    openai_is_configured,
+    resolve_llm_selection,
+)
 from .search import index_chunks, opensearch, qdrant, retrieve
 
 settings = get_settings()
@@ -77,6 +87,8 @@ class AskRequest(BaseModel):
     user_id: str = "demo-user"
     session_id: str = "demo-session"
     mode: Literal["baseline", "agent"] | None = None
+    llm_provider: Literal["ollama", "openai"] | None = None
+    llm_model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class FeedbackRequest(BaseModel):
@@ -95,12 +107,13 @@ def capabilities() -> dict:
     return {
         "default_mode": "agent" if settings.agent_enabled else "baseline",
         "agent_demo_override_enabled": settings.agent_demo_override_enabled,
+        "llm": llm_capabilities(settings),
     }
 
 
 @app.get("/readyz")
 def readyz(db: Session = Depends(get_db)) -> dict:
-    checks: dict[str, str] = {}
+    checks: dict[str, Any] = {}
     try:
         db.execute(text("SELECT 1"))
         checks["postgres"] = "ok"
@@ -109,14 +122,34 @@ def readyz(db: Session = Depends(get_db)) -> dict:
     for name, check in (
         ("qdrant", lambda: qdrant().get_collections()),
         ("opensearch", lambda: opensearch().cluster.health()),
-        ("ollama", lambda: check_ollama_model()),
     ):
         try:
             check()
             checks[name] = "ok"
         except Exception:
             checks[name] = "error"
-    if any(value != "ok" for value in checks.values()):
+    provider_checks: dict[str, str] = {
+        "openai": (
+            "configured"
+            if openai_is_configured(settings)
+            else ("disabled" if not settings.openai_enabled else "not_configured")
+        )
+    }
+    try:
+        check_ollama_model()
+        provider_checks["ollama"] = "ok"
+    except Exception:
+        provider_checks["ollama"] = "error"
+    default_ready = (
+        provider_checks["ollama"] == "ok"
+        if settings.llm_default_provider == "ollama"
+        else provider_checks["openai"] == "configured"
+    )
+    checks["llm_providers"] = provider_checks
+    stores_ready = all(
+        value == "ok" for key, value in checks.items() if key != "llm_providers"
+    )
+    if not stores_ready or not default_ready:
         raise HTTPException(503, detail=checks)
     return {"status": "ready", "checks": checks}
 
@@ -232,6 +265,13 @@ def ask(
 ) -> dict:
     if payload.mode is not None and not settings.agent_demo_override_enabled:
         raise HTTPException(403, "Request-level demo mode is disabled")
+    try:
+        selection = resolve_llm_selection(
+            payload.llm_provider, payload.llm_model, settings=settings
+        )
+    except LlmSelectionError as exc:
+        raise HTTPException(exc.status_code, detail=str(exc)) from exc
+    llm = create_llm_session(selection, settings=settings)
     use_agent = settings.agent_enabled
     if payload.mode is not None:
         use_agent = payload.mode == "agent"
@@ -254,6 +294,7 @@ def ask(
             answer=input_assessment.message or "Запрос не может быть обработан.",
             agent_enabled=use_agent,
             details={"input_guard": "rejected"},
+            llm=llm,
         )
 
     if use_agent:
@@ -263,6 +304,7 @@ def ask(
                 payload.user_id,
                 payload.session_id,
                 str(trace.id),
+                llm=llm,
             )
         except Exception as exc:
             return _finish_controlled(
@@ -278,23 +320,34 @@ def ask(
                 ),
                 agent_enabled=True,
                 details={"error": str(exc), "fallback_attempted": False},
+                llm=llm,
             )
         latency_ms = round((time.perf_counter() - started) * 1000)
         sources = result["sources"]
-        usage = result["usage"]
         retrieval_trace = result["retrieval"]
         details = result["trace_details"]
         validation = details.get("validation", {})
         outcome = details.get("outcome", "technical_error")
         reason_code = details.get("reason_code") or details.get("refusal_reason")
+        if outcome == "technical_error" and llm.last_error_category:
+            reason_code = f"llm_{llm.last_error_category}"
+            result["answer"] = (
+                "Выбранный языковой провайдер не смог завершить запрос. "
+                "Автоматическое переключение модели не выполнялось. Повторите запрос позже."
+            )
         trace.answer = result["answer"]
         trace.retrieved_count = result["retrieved_count"]
         trace.selected_count = len(sources)
-        trace.prompt_tokens = usage.get("prompt_eval_count")
-        trace.completion_tokens = usage.get("eval_count")
+        trace.prompt_tokens = llm.input_tokens if llm.calls else None
+        trace.completion_tokens = llm.output_tokens if llm.calls else None
         trace.latency_ms = latency_ms
         trace.status = "failed" if outcome == "technical_error" else "ok"
-        trace.details = {**details, "outcome": outcome, "reason_code": reason_code}
+        trace.details = {
+            **details,
+            **llm.summary(),
+            "outcome": outcome,
+            "reason_code": reason_code,
+        }
         db.commit()
         return {
             "answer": result["answer"],
@@ -303,6 +356,8 @@ def ask(
             "trace_id": str(trace.id),
             "outcome": outcome,
             "reason_code": reason_code,
+            "llm_provider": selection.provider,
+            "llm_model": selection.model,
             "metrics": {
                 "latency_ms": latency_ms,
                 "prompt_tokens": trace.prompt_tokens,
@@ -322,12 +377,17 @@ def ask(
                 "agent_enabled": True,
                 "agent_search_calls": details.get("search_calls", 0),
                 "agent_llm_calls": details.get("llm_calls", 0),
+                "llm_calls": llm.calls,
                 "agent_steps": details.get("step_count", 0),
                 "agent_retries": details.get("retries", 0),
+                "llm_provider": selection.provider,
+                "llm_model": selection.model,
+                "provider_latency_ms": llm.summary()["provider_latency_ms"],
+                "provider_error_category": llm.last_error_category,
             },
         }
 
-    return _run_baseline(payload, db, trace, started)
+    return _run_baseline(payload, db, trace, started, llm)
 
 
 def _finish_controlled(
@@ -345,6 +405,7 @@ def _finish_controlled(
     retrieval: dict | None = None,
     details: dict | None = None,
     usage: dict | None = None,
+    llm: LlmSession | None = None,
 ) -> dict:
     sources = sources or []
     usage = usage or {}
@@ -358,8 +419,13 @@ def _finish_controlled(
     trace.answer = answer
     trace.retrieved_count = retrieved_count
     trace.selected_count = len(sources)
-    trace.prompt_tokens = usage.get("prompt_eval_count")
-    trace.completion_tokens = usage.get("eval_count")
+    llm_summary = llm.summary() if llm else {}
+    trace.prompt_tokens = (
+        llm_summary.get("input_tokens") if llm_summary.get("llm_calls") else None
+    )
+    trace.completion_tokens = (
+        llm_summary.get("output_tokens") if llm_summary.get("llm_calls") else None
+    )
     trace.latency_ms = latency_ms
     trace.status = "failed" if outcome == "technical_error" else "ok"
     trace.details = {
@@ -369,6 +435,7 @@ def _finish_controlled(
         "source_ids": [source.get("chunk_id") for source in sources],
         "llm_calls": 0,
         **(details or {}),
+        **llm_summary,
     }
     db.commit()
     return {
@@ -378,6 +445,8 @@ def _finish_controlled(
         "trace_id": str(trace.id),
         "outcome": outcome,
         "reason_code": reason_code,
+        "llm_provider": llm_summary.get("llm_provider"),
+        "llm_model": llm_summary.get("llm_model"),
         "metrics": {
             "latency_ms": latency_ms,
             "prompt_tokens": trace.prompt_tokens,
@@ -399,14 +468,23 @@ def _finish_controlled(
             "agent_enabled": agent_enabled,
             "agent_search_calls": 0,
             "agent_llm_calls": int((details or {}).get("llm_calls", 0)),
+            "llm_calls": llm_summary.get("llm_calls", 0),
             "agent_steps": 0,
             "agent_retries": 0,
+            "llm_provider": llm_summary.get("llm_provider"),
+            "llm_model": llm_summary.get("llm_model"),
+            "provider_latency_ms": llm_summary.get("provider_latency_ms"),
+            "provider_error_category": llm_summary.get("provider_error_category"),
         },
     }
 
 
 def _run_baseline(
-    payload: AskRequest, db: Session, trace: SearchTrace, started: float
+    payload: AskRequest,
+    db: Session,
+    trace: SearchTrace,
+    started: float,
+    llm: LlmSession,
 ) -> dict:
     citation_repair_attempted = False
     citation_repair_error = None
@@ -429,6 +507,7 @@ def _run_baseline(
                 agent_enabled=False,
                 retrieved_count=retrieved_count,
                 retrieval=retrieval_trace,
+                llm=llm,
             )
         elif requires_temporal_abstention(payload.question, sources):
             answer = build_temporal_abstention(sources)
@@ -439,59 +518,22 @@ def _run_baseline(
             reason_code = "temporal_evidence_gap"
         else:
             prompt = build_answer_prompt(payload.question, sources)
-            response = httpx.post(
-                f"{settings.ollama_url}/api/chat",
-                json={
-                    "model": settings.ollama_model,
-                    "stream": False,
-                    "think": settings.ollama_think,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "options": {
-                        "temperature": settings.ollama_temperature,
-                        "num_predict": settings.ollama_num_predict,
-                    },
-                },
-                timeout=300,
-            )
-            response.raise_for_status()
-            usage = response.json()
+            answer, usage = llm.generate(prompt)
             llm_calls += 1
-            answer = usage["message"]["content"].strip()
-            if not answer:
-                raise RuntimeError("Ollama returned an empty answer")
             citations_valid = citation_ids_admissible(answer, len(sources))
             if not citations_valid:
                 citation_repair_attempted = True
                 try:
-                    repair_response = httpx.post(
-                        f"{settings.ollama_url}/api/chat",
-                        json={
-                            "model": settings.ollama_model,
-                            "stream": False,
-                            "think": settings.ollama_think,
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": build_citation_repair_prompt(
-                                        prompt, answer, len(sources)
-                                    ),
-                                }
-                            ],
-                            "options": {
-                                "temperature": settings.ollama_temperature,
-                                "num_predict": settings.ollama_num_predict,
-                            },
-                        },
-                        timeout=300,
+                    repaired_answer, repair_usage = llm.generate(
+                        build_citation_repair_prompt(prompt, answer, len(sources))
                     )
-                    repair_response.raise_for_status()
-                    repair_usage = repair_response.json()
                     llm_calls += 1
-                    usage = merge_ollama_usage(usage, repair_usage)
-                    repaired_answer = repair_usage["message"]["content"].strip()
+                    usage = merge_llm_usage(usage, repair_usage)
                     if repaired_answer:
                         answer = repaired_answer
-                except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                except LlmProviderError:
+                    raise
+                except (KeyError, TypeError, ValueError) as exc:
                     citation_repair_error = str(exc)
                 citations_valid = citation_ids_admissible(answer, len(sources))
             if not citations_valid:
@@ -516,34 +558,16 @@ def _run_baseline(
                         "citation_repair_error": citation_repair_error,
                         "llm_calls": llm_calls,
                     },
+                    llm=llm,
                 )
 
-            validation_response = httpx.post(
-                f"{settings.ollama_url}/api/chat",
-                json={
-                    "model": settings.ollama_model,
-                    "stream": False,
-                    "think": settings.ollama_think,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": build_grounding_validation_prompt(
-                                payload.question, answer, sources
-                            ),
-                        }
-                    ],
-                    "options": {
-                        "temperature": settings.ollama_temperature,
-                        "num_predict": settings.ollama_num_predict,
-                    },
-                },
-                timeout=300,
+            validation_text, validation_usage = llm.generate(
+                build_grounding_validation_prompt(payload.question, answer, sources),
+                json_schema=GROUNDING_VALIDATION_SCHEMA,
+                schema_name="grounding_validation",
             )
-            validation_response.raise_for_status()
-            validation_usage = validation_response.json()
             llm_calls += 1
-            usage = merge_ollama_usage(usage, validation_usage)
-            validation_text = validation_usage["message"]["content"].strip()
+            usage = merge_llm_usage(usage, validation_usage)
             grounded, validation_failures = parse_grounding_validation(validation_text)
             if not grounded:
                 return _finish_controlled(
@@ -563,6 +587,7 @@ def _run_baseline(
                     retrieval=retrieval_trace,
                     usage=usage,
                     details={"validation_failures": validation_failures, "llm_calls": llm_calls},
+                    llm=llm,
                 )
             outcome = "answered"
             reason_code = "grounded_answer"
@@ -570,8 +595,8 @@ def _run_baseline(
         trace.answer = answer
         trace.retrieved_count = retrieved_count
         trace.selected_count = len(sources)
-        trace.prompt_tokens = usage.get("prompt_eval_count")
-        trace.completion_tokens = usage.get("eval_count")
+        trace.prompt_tokens = llm.input_tokens if llm.calls else None
+        trace.completion_tokens = llm.output_tokens if llm.calls else None
         trace.latency_ms = latency_ms
         trace.status = "ok"
         trace.details = {
@@ -587,7 +612,12 @@ def _run_baseline(
             "citation_repair_error": citation_repair_error,
             "llm_calls": llm_calls,
             "reranking": retrieval_trace,
-            "ollama": ollama_metrics(usage),
+            **llm.summary(),
+            **(
+                {"ollama": ollama_metrics(usage)}
+                if llm.selection.provider == "ollama"
+                else {}
+            ),
         }
         db.commit()
         return {
@@ -597,6 +627,8 @@ def _run_baseline(
             "trace_id": str(trace.id),
             "outcome": outcome,
             "reason_code": reason_code,
+            "llm_provider": llm.selection.provider,
+            "llm_model": llm.selection.model,
             "metrics": {
                 "latency_ms": latency_ms,
                 "prompt_tokens": trace.prompt_tokens,
@@ -614,9 +646,34 @@ def _run_baseline(
                     "reranker_fallback" if retrieval_trace["fallback_reason"] else None
                 ),
                 "agent_enabled": False,
-                **ollama_metrics(usage),
+                "llm_calls": llm.calls,
+                "llm_provider": llm.selection.provider,
+                "llm_model": llm.selection.model,
+                "provider_latency_ms": llm.summary()["provider_latency_ms"],
+                "provider_error_category": llm.last_error_category,
+                **(
+                    ollama_metrics(usage)
+                    if llm.selection.provider == "ollama"
+                    else {}
+                ),
             },
         }
+    except LlmProviderError as exc:
+        return _finish_controlled(
+            db,
+            trace,
+            started,
+            mode="baseline",
+            outcome="technical_error",
+            reason_code=f"llm_{exc.category}",
+            answer=(
+                "Выбранный языковой провайдер не смог завершить запрос. "
+                "Автоматическое переключение модели не выполнялось. Повторите запрос позже."
+            ),
+            agent_enabled=False,
+            details={"provider_error_category": exc.category, "llm_calls": llm.calls},
+            llm=llm,
+        )
     except Exception as exc:
         return _finish_controlled(
             db,
@@ -631,6 +688,7 @@ def _run_baseline(
             ),
             agent_enabled=False,
             details={"error": str(exc), "llm_calls": llm_calls},
+            llm=llm,
         )
 
 

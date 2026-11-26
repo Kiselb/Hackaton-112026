@@ -17,7 +17,8 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - финальная проверка `active=true` и `status=ready` по PostgreSQL;
 - опциональный локальный CrossEncoder reranking после проверки активности;
 - bounded AI-Агент по умолчанию с input guardrails, evidence assessment и fail-closed answer validation;
-- локальный ответ Ollama с numbered sources и проверкой номеров цитат;
+- request-level выбор локального Ollama или OpenAI Responses API с единым LLM-интерфейсом;
+- numbered sources, semantic grounding и проверка номеров цитат для обоих провайдеров;
 - traces, timings и token counts в PostgreSQL;
 - деактивация и восстановление документов;
 - React UI поиска, кликабельных источников, feedback и административной аналитики;
@@ -71,6 +72,11 @@ AI-Агент настраивается через `AGENT_ENABLED`, `AGENT_MAX_
 При исключении agent runtime возвращается контролируемый `technical_error`; автоматический
 переход в Базовый RAG запрещён. Strict outcome и порядок безопасного обновления стенда:
 [docs/CLIP012_STRICT_AGENT.md](docs/CLIP012_STRICT_AGENT.md).
+
+LLM по умолчанию остаётся `ollama`/`qwen3.5:9b`. Опциональный OpenAI включается только
+backend-настройками, использует Responses API с `store=false` и серверный allowlist
+моделей. Выбор provider/model действует на один запрос и не меняет глобальную
+конфигурацию: [docs/CLIP013_LLM_PROVIDERS.md](docs/CLIP013_LLM_PROVIDERS.md).
 
 Для локальной браузерной демонстрации можно отдельно установить
 `AGENT_DEMO_OVERRIDE_ENABLED=true`. Тогда UI показывает request-level выбор режима;
@@ -190,13 +196,13 @@ Smoke следует запускать на свежих проектных р�
 ## API
 
 - `GET /healthz` — процесс запущен;
-- `GET /readyz` — доступны три хранилища, Ollama и настроенная модель;
+- `GET /readyz` — доступны три хранилища и default LLM-провайдер;
 - `POST /api/v1/documents` — загрузка и синхронная индексация;
 - `GET /api/v1/documents` — реестр;
 - `POST /api/v1/documents/{id}/deactivate`;
 - `POST /api/v1/documents/{id}/restore`;
 - `POST /api/v1/ask`;
-- `GET /api/v1/capabilities` — доступность локального demo override;
+- `GET /api/v1/capabilities` — demo override и безопасный список LLM-провайдеров/моделей;
 - `GET /api/v1/admin/analytics` — агрегаты, mode share, latency/tokens и динамика;
 - `GET /api/v1/admin/traces` — фильтруемый список с `limit`/`offset`;
 - `GET /api/v1/admin/traces/{id}` — ответ, evidence и безопасная проекция trajectory;

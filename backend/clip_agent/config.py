@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +19,16 @@ class Settings(BaseSettings):
     ollama_think: bool = False
     ollama_temperature: float = 0.0
     ollama_num_predict: int = 512
+    ollama_timeout_seconds: float = Field(default=300.0, gt=0, le=600)
+    llm_default_provider: Literal["ollama", "openai"] = "ollama"
+    llm_max_total_tokens_per_request: int = Field(default=12000, ge=256, le=1_000_000)
+    openai_enabled: bool = False
+    openai_api_key: SecretStr | None = None
+    openai_default_model: str = "gpt-6.2-sol"
+    openai_allowed_models: str = "gpt-6.2-sol,gpt-6.2-astra"
+    openai_timeout_seconds: float = Field(default=45.0, gt=0, le=300)
+    openai_max_output_tokens: int = Field(default=2048, ge=64, le=128000)
+    openai_reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: str = "cpu"
     rerank_enabled: bool = False

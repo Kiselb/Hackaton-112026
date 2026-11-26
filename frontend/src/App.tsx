@@ -4,6 +4,7 @@ const DEMO_USER = "web-demo";
 const DEMO_SESSION = "browser";
 
 type Mode = "baseline" | "agent";
+type LlmProvider = "ollama" | "openai";
 type Outcome = "answered" | "clarification_required" | "quality_review_required" |
   "conflict_detected" | "out_of_scope" | "invalid_input" | "technical_error";
 type FeedbackRating = "helpful" | "incomplete" | "incorrect" | "missing_documents";
@@ -97,6 +98,8 @@ type AskMetrics = {
   completion_tokens?: number | null;
   agent_enabled?: boolean;
   citations_valid?: boolean;
+  llm_provider?: LlmProvider;
+  llm_model?: string;
 };
 
 type AskResult = {
@@ -105,7 +108,28 @@ type AskResult = {
   trace_id: string;
   outcome: Outcome;
   reason_code: string | null;
+  llm_provider: LlmProvider;
+  llm_model: string;
   metrics: AskMetrics;
+};
+
+type LlmProviderCapability = {
+  id: LlmProvider;
+  label: string;
+  enabled: boolean;
+  configured: boolean;
+  available: boolean;
+  default_model: string;
+  models: string[];
+};
+
+type Capabilities = {
+  default_mode: Mode;
+  agent_demo_override_enabled: boolean;
+  llm: {
+    default_provider: LlmProvider;
+    providers: LlmProviderCapability[];
+  };
 };
 
 const defaultQuestion =
@@ -251,14 +275,36 @@ function MetricCard({value, label, note}: {value: ReactNode; label: string; note
   return <div className="metric-card"><b>{value}</b><span>{label}</span>{note && <small>{note}</small>}</div>;
 }
 
-function SearchView({capabilities}: {capabilities: {default_mode: Mode; agent_demo_override_enabled: boolean}}) {
+function SearchView({capabilities}: {capabilities: Capabilities}) {
   const [question, setQuestion] = useState(defaultQuestion);
   const [requestedMode, setRequestedMode] = useState<Mode>(capabilities.default_mode);
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>(capabilities.llm.default_provider);
+  const initialProvider = capabilities.llm.providers.find(
+    (provider) => provider.id === capabilities.llm.default_provider,
+  ) ?? capabilities.llm.providers[0];
+  const [llmModel, setLlmModel] = useState(initialProvider.default_model);
   const [result, setResult] = useState<AskResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => setRequestedMode(capabilities.default_mode), [capabilities.default_mode]);
+  useEffect(() => {
+    setLlmProvider(capabilities.llm.default_provider);
+    const selected = capabilities.llm.providers.find(
+      (provider) => provider.id === capabilities.llm.default_provider,
+    );
+    if (selected) setLlmModel(selected.default_model);
+  }, [capabilities]);
+
+  const selectedProvider = capabilities.llm.providers.find(
+    (provider) => provider.id === llmProvider,
+  ) ?? initialProvider;
+
+  function changeProvider(provider: LlmProvider) {
+    setLlmProvider(provider);
+    const selected = capabilities.llm.providers.find((item) => item.id === provider);
+    if (selected) setLlmModel(selected.default_model);
+  }
 
   async function submitQuestion(event: FormEvent) {
     event.preventDefault();
@@ -273,6 +319,8 @@ function SearchView({capabilities}: {capabilities: {default_mode: Mode; agent_de
           question,
           user_id: DEMO_USER,
           session_id: DEMO_SESSION,
+          llm_provider: llmProvider,
+          llm_model: llmModel,
           ...(capabilities.agent_demo_override_enabled ? {mode: requestedMode} : {}),
         }),
       });
@@ -290,19 +338,35 @@ function SearchView({capabilities}: {capabilities: {default_mode: Mode; agent_de
     <form className="panel ask" onSubmit={submitQuestion}>
       <div className="form-heading">
         <div><span className="section-kicker">Поиск с доказательствами</span><h2>Вопрос по документам</h2></div>
-        {capabilities.agent_demo_override_enabled ? <label className="mode-select">Режим
-          <select value={requestedMode} onChange={(event) => setRequestedMode(event.target.value as Mode)}>
-            <option value="baseline">Базовый RAG</option>
-            <option value="agent">AI-Агент</option>
-          </select>
-        </label> : <ModeBadge mode={capabilities.default_mode} />}
+        <div className="request-controls">
+          <label className="mode-select">Языковая модель
+            <select value={llmProvider} onChange={(event) => changeProvider(event.target.value as LlmProvider)}>
+              {capabilities.llm.providers.map((provider) => <option
+                disabled={!provider.available}
+                key={provider.id}
+                value={provider.id}
+              >{provider.label}{!provider.available ? " — недоступен" : ""}</option>)}
+            </select>
+          </label>
+          {selectedProvider.models.length > 1 && <label className="mode-select">Модель
+            <select value={llmModel} onChange={(event) => setLlmModel(event.target.value)}>
+              {selectedProvider.models.map((model) => <option key={model} value={model}>{model}</option>)}
+            </select>
+          </label>}
+          {capabilities.agent_demo_override_enabled ? <label className="mode-select">Режим
+            <select value={requestedMode} onChange={(event) => setRequestedMode(event.target.value as Mode)}>
+              <option value="baseline">Базовый RAG</option>
+              <option value="agent">AI-Агент</option>
+            </select>
+          </label> : <ModeBadge mode={capabilities.default_mode} />}
+        </div>
       </div>
       {capabilities.agent_demo_override_enabled && <p className="notice compact">
         Локальный demo override включён конфигурацией сервера. Он действует только для этого запроса.
       </p>}
       <label htmlFor="question">Сформулируйте вопрос</label>
       <textarea id="question" required value={question} onChange={(event) => setQuestion(event.target.value)} />
-      <button className="primary wide" disabled={busy}>{busy ? "Ищу локально…" : "Найти ответ"}</button>
+      <button className="primary wide" disabled={busy}>{busy ? "Формирую ответ…" : "Найти ответ"}</button>
     </form>
     {error && <div className="error">{error}</div>}
     {result && <>
@@ -320,6 +384,7 @@ function SearchView({capabilities}: {capabilities: {default_mode: Mode; agent_de
           <span>{formatNumber(result.metrics.latency_ms)} мс</span>
           <span>{formatNumber(result.metrics.prompt_tokens)} input tokens</span>
           <span>{formatNumber(result.metrics.completion_tokens)} output tokens</span>
+          <span>{result.llm_provider === "openai" ? "OpenAI" : "Ollama"} · {result.llm_model}</span>
           <span>{result.metrics.citations_valid ? "Цитаты проверены синтаксически" : "Цитаты требуют проверки"}</span>
         </div>
         <FeedbackForm traceId={result.trace_id} />
@@ -469,7 +534,7 @@ function DocumentsView({documents, busy, reload}: {documents: DocumentItem[]; bu
 
 export default function App() {
   const [tab, setTab] = useState<"search" | "analytics" | "traces" | "documents">("search");
-  const [capabilities, setCapabilities] = useState<{default_mode: Mode; agent_demo_override_enabled: boolean} | null>(null);
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [documentsBusy, setDocumentsBusy] = useState(false);

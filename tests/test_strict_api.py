@@ -1,5 +1,6 @@
 from uuid import uuid4
 
+from clip_agent import llm as llm_module
 from clip_agent import main
 from clip_agent.config import Settings
 
@@ -81,7 +82,7 @@ def test_baseline_answer_requires_semantic_grounding_validation(monkeypatch):
             Response('{"valid":true,"unsupported_claims":[],"scope_errors":[]}'),
         ]
     )
-    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(llm_module.httpx, "post", lambda *args, **kwargs: next(responses))
     db = FakeDb()
 
     result = main.ask(main.AskRequest(question="Какой лимит установлен?"), db)
@@ -89,6 +90,8 @@ def test_baseline_answer_requires_semantic_grounding_validation(monkeypatch):
     assert result["outcome"] == "answered"
     assert result["answer"] == "Лимит составляет 10 рублей [1]."
     assert result["metrics"]["citations_valid"] is True
+    assert result["llm_provider"] == "ollama"
+    assert result["llm_model"] == main.settings.ollama_model
     assert db.trace.details["outcome"] == "answered"
 
 
@@ -104,7 +107,7 @@ def test_baseline_unsupported_conclusion_is_replaced_with_safe_outcome(monkeypat
             ),
         ]
     )
-    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(llm_module.httpx, "post", lambda *args, **kwargs: next(responses))
     db = FakeDb()
 
     result = main.ask(main.AskRequest(question="Кому применяется правило?"), db)
@@ -127,7 +130,7 @@ def test_baseline_inconsistent_validator_result_does_not_publish_draft(monkeypat
             ),
         ]
     )
-    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(llm_module.httpx, "post", lambda *args, **kwargs: next(responses))
     db = FakeDb()
 
     result = main.ask(main.AskRequest(question="Кому применяется лимит?"), db)
@@ -143,7 +146,7 @@ def test_baseline_invalid_validator_json_is_a_technical_error(monkeypatch):
     monkeypatch.setattr(main.settings, "agent_enabled", False)
     monkeypatch.setattr(main, "retrieve", lambda question: ([evidence()], 1, retrieval_trace()))
     responses = iter([Response("Лимит составляет 10 рублей [1]."), Response("not-json")])
-    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(llm_module.httpx, "post", lambda *args, **kwargs: next(responses))
     db = FakeDb()
 
     result = main.ask(main.AskRequest(question="Какой лимит установлен?"), db)

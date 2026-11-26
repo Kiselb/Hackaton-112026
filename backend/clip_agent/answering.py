@@ -17,6 +17,17 @@ EFFECTIVE_PERIOD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+GROUNDING_VALIDATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "valid": {"type": "boolean"},
+        "unsupported_claims": {"type": "array", "items": {"type": "string"}},
+        "scope_errors": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["valid", "unsupported_claims", "scope_errors"],
+    "additionalProperties": False,
+}
+
 
 def requires_temporal_abstention(question: str, sources: list[dict[str, Any]]) -> bool:
     if not TEMPORAL_STATUS_PATTERN.search(question):
@@ -133,7 +144,7 @@ def build_citation_repair_prompt(original_prompt: str, draft: str, source_count:
     )
 
 
-def merge_ollama_usage(primary: dict[str, Any], repair: dict[str, Any]) -> dict[str, Any]:
+def merge_llm_usage(primary: dict[str, Any], repair: dict[str, Any]) -> dict[str, Any]:
     merged = {**primary, **repair}
     for name in (
         "prompt_eval_count",
@@ -148,3 +159,7 @@ def merge_ollama_usage(primary: dict[str, Any], repair: dict[str, Any]) -> dict[
         if numeric:
             merged[name] = sum(numeric)
     return merged
+
+
+# Backward-compatible name for existing imports and tests.
+merge_ollama_usage = merge_llm_usage

@@ -4,7 +4,8 @@
 
 1. Find evidence across multiple corporate regulations, independent orders, product descriptions and licensing rules.
 2. Always reveal the document, page (when actually available), paragraph and search span inside the parent context.
-3. Work with fully local inference and no cloud data processing at runtime.
+3. Keep local Ollama as the default; allow an explicitly configured request-level OpenAI
+   path without hidden fallback or external retrieval tools.
 4. Record agent trajectories and produce searchable quality analytics even without customer-provided golden answers.
 5. Make it easy to replace search/index/model components through narrow adapters.
 
@@ -13,8 +14,8 @@
 - **Presentation:** React+TS, two views (search/admin), demo identities.
 - **Application/API:** FastAPI request validation, upload ingestion, query lifecycle, feedback.
 - **Agent:** LangGraph, bounded graph, evidence-based answer synthesis.
-- **Model adapters:** Ollama Qwen3.5-9B, SentenceTransformers BGE-M3 и опциональный
-  BGE CrossEncoder reranker.
+- **Model adapters:** request-scoped Ollama/OpenAI LLM session, SentenceTransformers
+  BGE-M3 и опциональный BGE CrossEncoder reranker.
 - **Stores:** Postgres relational source of truth; Qdrant and OpenSearch are rebuildable derived indexes; file storage is filesystem adapter.
 - **Observability:** structured node decisions, retrieval details, token counters, response latency, outcomes; DB for MVP, OTel/MLflow/Langfuse later.
 - **Analytics UI:** deterministic overlapping outcome labels over `SearchTrace`, bounded
@@ -39,6 +40,7 @@ Important: a revised regulation is *technical lineage*; replacing a particular b
 
 ```text
 question + user_id + session_id
+    -> resolve allowlisted request-level LLM provider/model (one session, no fallback)
     -> deterministic input guard (language, meaningfulness, scope, injection)
     -> AGENT_ENABLED=false: strict single-query RAG
     -> AGENT_ENABLED=true (default for new configs): LangGraph
@@ -50,8 +52,8 @@ question + user_id + session_id
          -> validate_answer (citations, scope/entailment guards, bounded repair, fail-closed)
     -> outcome (answered / clarification / quality review / conflict / rejection / technical)
          -> finish
-    -> PostgreSQL SearchTrace with node trajectory, decisions, queries, source IDs,
-       gaps, per-node latency, tokens and bounded call counters
+    -> PostgreSQL SearchTrace with provider/model, node trajectory, decisions, queries,
+       source IDs, gaps, per-node latency, actual tokens and bounded call counters
 ```
 
 **Evidence is always SQL-filtered** even if stale derived search indexes return older records. Numeric citation ID maps to an immutable search child, whose parent text is displayed with its exact start/end offsets. The generator sees the parent context; the UI highlights the search child.
@@ -73,6 +75,11 @@ LLM calls by default. The only graph loop is
 `assess_evidence -> targeted_retrieve -> assess_evidence`; retry/search budgets and
 LangGraph recursion limit make it finite. State is request-local and is not long-term or
 shared memory.
+
+The same request-scoped LLM session is used for planning, evidence assessment, answer
+composition, citation repair and grounding validation. OpenAI uses the Responses API with
+`store=false`, no hosted tools and strict server-side model allowlisting. Missing credentials,
+provider failure, refusal, incomplete or empty output fail closed and never switch provider.
 
 ## Search analytics and feedback
 
