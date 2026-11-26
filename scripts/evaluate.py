@@ -18,9 +18,19 @@ from sqlalchemy.engine import make_url
 
 from clip_agent.config import Settings
 from clip_agent.evaluation import aggregate_results, compare_runs, evaluate_case, load_dataset
+from clip_agent.extract import extract_text
+from clip_agent.chunking import chunk_text
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+MIME_TYPES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+}
 
 
 def digest(data: bytes) -> str:
@@ -38,9 +48,12 @@ def load_corpus_config(path: Path) -> dict[str, Any]:
     filenames: set[str] = set()
     fragment_ids: set[str] = set()
     for document in config["documents"]:
-        for field in ("source_id", "filename", "title", "path", "fragments"):
+        for field in ("source_id", "filename", "title", "path"):
             if field not in document:
                 raise ValueError(f"corpus document missing {field!r}")
+        passages = document.get("passages", document.get("fragments"))
+        if passages is None:
+            raise ValueError("corpus document missing 'passages' or legacy 'fragments'")
         if document["source_id"] in source_ids or document["filename"] in filenames:
             raise ValueError("corpus source_id and filename must be unique")
         source_ids.add(document["source_id"])
@@ -48,11 +61,14 @@ def load_corpus_config(path: Path) -> dict[str, Any]:
         document_path = (path.parent / document["path"]).resolve()
         if not document_path.is_relative_to(ROOT):
             raise ValueError(f"corpus document is outside repository: {document_path}")
-        text_value = document_path.read_text(encoding="utf-8")
-        for fragment in document["fragments"]:
-            fragment_id, quote = fragment.get("fragment_id"), fragment.get("quote")
+        text_value = extract_text(document["filename"], document_path.read_bytes())
+        if not text_value.strip():
+            raise ValueError(f"corpus document has no extractable text: {document['filename']}")
+        for fragment in passages:
+            fragment_id = fragment.get("passage_id", fragment.get("fragment_id"))
+            quote = fragment.get("quote")
             if not fragment_id or fragment_id in fragment_ids:
-                raise ValueError("corpus fragment_id must be non-empty and unique")
+                raise ValueError("corpus passage_id must be non-empty and unique")
             if not quote or quote not in text_value:
                 raise ValueError(
                     f"gold fragment {fragment_id!r} is not present in {document['filename']}"
@@ -76,6 +92,26 @@ def corpus_manifest(config_path: Path, config: dict[str, Any]) -> dict[str, Any]
         "config_sha256": config_sha256,
         "files": files,
     }
+
+
+def corpus_inventory(config_path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
+    inventory = []
+    for document in config["documents"]:
+        path = (config_path.parent / document["path"]).resolve()
+        data = path.read_bytes()
+        extracted = extract_text(document["filename"], data)
+        inventory.append(
+            {
+                "source_id": document["source_id"],
+                "filename": document["filename"],
+                "sha256": digest(data),
+                "size_bytes": len(data),
+                "extraction_succeeded": bool(extracted.strip()),
+                "extracted_chars": len(extracted),
+                "expected_chunk_count": len(chunk_text(extracted)),
+            }
+        )
+    return inventory
 
 
 def corpus_manifests_match(saved: dict[str, Any], current: dict[str, Any]) -> bool:
@@ -217,7 +253,7 @@ def ensure_corpus(
     corpus: dict[str, Any],
     config_path: Path,
     config: dict[str, Any],
-) -> str:
+) -> tuple[str, list[dict[str, Any]]]:
     response = client.get("/api/v1/documents")
     response.raise_for_status()
     documents = response.json()
@@ -230,33 +266,43 @@ def ensure_corpus(
             )
         if any(item["status"] != "ready" or not item["active"] for item in documents):
             raise RuntimeError("isolated corpus contains non-ready or inactive documents")
-        return "reused"
+        return "reused", documents
     if manifest_path.exists():
         raise RuntimeError("corpus manifest exists but isolated database is empty")
     for document in config["documents"]:
         path = (config_path.parent / document["path"]).resolve()
         upload = client.post(
             "/api/v1/documents",
-            files={"file": (document["filename"], path.read_bytes(), "text/plain")},
+            files={
+                "file": (
+                    document["filename"],
+                    path.read_bytes(),
+                    MIME_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+                )
+            },
             data={"title": document["title"]},
         )
         upload.raise_for_status()
     write_json(manifest_path, corpus)
-    return "indexed"
+    indexed = client.get("/api/v1/documents")
+    indexed.raise_for_status()
+    return "indexed", indexed.json()
 
 
 def validate_gold(cases: list[dict[str, Any]], config: dict[str, Any]) -> None:
     source_ids = {document["source_id"] for document in config["documents"]}
     fragment_ids = {
-        fragment["fragment_id"]
+        fragment.get("passage_id", fragment.get("fragment_id"))
         for document in config["documents"]
-        for fragment in document["fragments"]
+        for fragment in document.get("passages", document.get("fragments", []))
     }
     for case in cases:
         unknown_sources = (
             set(case["expected_sources"]) | set(case.get("relevance_grades", {}))
         ) - source_ids
-        unknown_fragments = set(case.get("expected_fragments", [])) - fragment_ids
+        unknown_fragments = set(
+            case.get("expected_passages", case.get("expected_fragments", []))
+        ) - fragment_ids
         if unknown_sources or unknown_fragments:
             raise ValueError(
                 f"{case['case_id']}: unknown gold sources={sorted(unknown_sources)}, "
@@ -271,12 +317,110 @@ def annotate_sources(payload: dict[str, Any], config: dict[str, Any]) -> None:
         if not document:
             continue
         source["source_id"] = document["source_id"]
-        evidence = source.get("child_text", "")
-        source["fragment_ids"] = [
-            fragment["fragment_id"]
-            for fragment in document["fragments"]
+        evidence = source.get("parent_text") or source.get("child_text", "")
+        passages = document.get("passages", document.get("fragments", []))
+        passage_ids = [
+            fragment.get("passage_id", fragment.get("fragment_id"))
+            for fragment in passages
             if fragment["quote"] in evidence
         ]
+        source["passage_ids"] = passage_ids
+        source["fragment_ids"] = passage_ids
+        normalized_evidence = " ".join(evidence.split())
+        source["retrieval_passage_id"] = (
+            f"retrieved:{digest((document['source_id'] + chr(0) + normalized_evidence).encode())[:20]}"
+        )
+
+
+def _combined_metrics(*payloads: dict[str, Any]) -> dict[str, Any]:
+    metrics = [payload.get("metrics", {}) for payload in payloads]
+    summed = {}
+    for key in (
+        "latency_ms",
+        "prompt_tokens",
+        "completion_tokens",
+        "agent_search_calls",
+        "agent_llm_calls",
+        "llm_calls",
+        "agent_steps",
+        "multi_query_search_calls",
+    ):
+        values = [item.get(key) for item in metrics if item.get(key) is not None]
+        summed[key] = sum(values) if values else None
+    if metrics:
+        summed.update(
+            {
+                key: metrics[-1].get(key)
+                for key in (
+                    "rerank_latency_ms",
+                    "multi_query_effective",
+                    "multi_query_unique_sources",
+                )
+            }
+        )
+    return summed
+
+
+def execute_case(
+    client: Any,
+    case: dict[str, Any],
+    *,
+    experiment_id: str,
+    multi_query: bool,
+    agent_enabled: bool,
+) -> dict[str, Any]:
+    request = {
+        "question": case["question"],
+        "user_id": "evaluation-lab",
+        "session_id": experiment_id,
+        "multi_query_enabled": multi_query,
+    }
+    initial_response = client.post("/api/v1/ask", json=request)
+    initial_response.raise_for_status()
+    initial = initial_response.json()
+    dialogue_spec = case.get("dialogue")
+    if not dialogue_spec:
+        return initial
+
+    dialogue = {
+        "initial_outcome": initial.get("outcome"),
+        "initial_answer": initial.get("answer"),
+        "initial_metrics": initial.get("metrics", {}),
+        "clarification_question": initial.get("answer"),
+        "user_reply": dialogue_spec.get("user_reply"),
+        "expected_final_outcome": dialogue_spec.get("expected_final_outcome"),
+        "turn_count": 1,
+        "trace_ids": [initial.get("trace_id")],
+    }
+    if not agent_enabled or initial.get("outcome") != "clarification_required":
+        initial["dialogue"] = {**dialogue, "final_outcome": initial.get("outcome")}
+        return initial
+
+    token = initial_response.headers.get("x-conversation-token")
+    conversation_id = initial.get("conversation_id")
+    if not token or not conversation_id or not dialogue_spec.get("user_reply"):
+        raise RuntimeError("clarification response lacks token, conversation_id, or user reply")
+    follow_up_response = client.post(
+        "/api/v1/ask",
+        headers={"X-Conversation-Token": token},
+        json={
+            **request,
+            "question": dialogue_spec["user_reply"],
+            "conversation_id": conversation_id,
+        },
+    )
+    follow_up_response.raise_for_status()
+    final = follow_up_response.json()
+    final["metrics"] = _combined_metrics(initial, final)
+    final["dialogue"] = {
+        **dialogue,
+        "final_outcome": final.get("outcome"),
+        "final_answer": final.get("answer"),
+        "final_metrics": follow_up_response.json().get("metrics", {}),
+        "turn_count": 2,
+        "trace_ids": [initial.get("trace_id"), final.get("trace_id")],
+    }
+    return final
 
 
 def report_markdown(run: dict[str, Any], results: list[dict[str, Any]]) -> str:
@@ -286,22 +430,36 @@ def report_markdown(run: dict[str, Any], results: list[dict[str, Any]]) -> str:
         f"Git SHA: `{run['git_commit_sha']}`  ",
         f"Source tree SHA-256: `{run['source_state']['sha256']}`  ",
         f"Dirty worktree: **{run['source_state']['dirty']}**  ",
-        f"Corpus SHA-256: `{run['corpus']['hash']}`", "",
-        "## Aggregate", "", "```json",
+        f"Corpus SHA-256: `{run['corpus']['hash']}`  ",
+        f"Gold status: **{run['dataset']['gold_status']}**  ",
+        f"Mode: **{run['mode']}** / Multi-Query: **{run['agent']['multi_query_requested']}**",
+        "", "## Corpus", "",
+        "| Source | Bytes | SHA-256 | Extracted chars | Chunks | Document ID |",
+        "|---|---:|---|---:|---:|---|",
+    ]
+    for item in run["corpus"]["documents"]:
+        lines.append(
+            f"| {item['filename']} | {item['size_bytes']} | `{item['sha256']}` | "
+            f"{item['extracted_chars']} | {item['indexed_chunk_count']} | "
+            f"`{item['document_id']}` |"
+        )
+    lines.extend([
+        "", "## Aggregate", "", "```json",
         json.dumps(run["summary"], ensure_ascii=False, indent=2), "```", "",
         "Automatic fact conditions are narrow and do not prove semantic correctness "
         "or citation entailment. Marked cases remain unresolved pending human review.",
         "", "## Cases", "",
-        "| Case | Category | R@1 | R@3 | R@5 | R@8 | MRR | nDCG@5 | Citations | Manual review | Error |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|",
-    ]
+        "| Case | Category | Doc R@1 | Doc R@3 | Passage R@5 | Passage P@5 | MRR | nDCG@3 | Outcome | Citations | Manual review | Error |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|",
+    ])
     for item in results:
         metric = item["metrics"]
         lines.append(
             f"| {item['case_id']} | {item['category']} | "
             f"{metric['document_recall_at_1']} | {metric['document_recall_at_3']} | "
-            f"{metric['document_recall_at_5']} | {metric['document_recall_at_8']} | "
-            f"{metric['mrr']} | {metric['ndcg_at_5']} | {metric['citation_ids_valid']} | "
+            f"{metric['passage_recall_at_5']} | {metric['passage_precision_at_5']} | "
+            f"{metric['mrr']} | {metric['ndcg_at_3']} | {metric['outcome']} | "
+            f"{metric['citation_ids_valid']} | "
             f"{item['manual_review_required']} | {item['error'] or ''} |"
         )
     lines.extend(["", "## Case details", ""])
@@ -333,6 +491,11 @@ def report_markdown(run: dict[str, Any], results: list[dict[str, Any]]) -> str:
 def evaluate(args: argparse.Namespace) -> int:
     if sys.version_info[:2] != (3, 12):
         raise RuntimeError(f"Python 3.12 is required, got {platform.python_version()}")
+    if args.mode == "baseline" and args.multi_query:
+        raise ValueError("Multi-Query cannot be requested in baseline mode")
+    if args.mode:
+        os.environ["AGENT_ENABLED"] = str(args.mode == "agent").lower()
+    os.environ["QUALITY_EMAIL_ENABLED"] = "false"
     dataset_path = Path(args.dataset).resolve()
     config_path = (
         Path(args.corpus_config).resolve()
@@ -343,6 +506,7 @@ def evaluate(args: argparse.Namespace) -> int:
     config = load_corpus_config(config_path)
     validate_gold(cases, config)
     corpus = corpus_manifest(config_path, config)
+    source_inventory = corpus_inventory(config_path, config)
     corpus_id, manifest_path = prepare_environment(config, corpus)
 
     # These imports must see the isolated resource names set above.
@@ -365,20 +529,19 @@ def evaluate(args: argparse.Namespace) -> int:
     results: list[dict[str, Any]] = []
     with TestClient(app, raise_server_exceptions=False) as client:
         ready = readiness(client, settings)
-        corpus_action = ensure_corpus(client, manifest_path, corpus, config_path, config)
+        corpus_action, indexed_documents = ensure_corpus(
+            client, manifest_path, corpus, config_path, config
+        )
+        indexed_by_name = {item["filename"]: item for item in indexed_documents}
         for case in cases:
             try:
-                response = client.post(
-                    "/api/v1/ask",
-                    json={
-                        "question": case["question"],
-                        "user_id": "evaluation-lab",
-                        "session_id": experiment_id,
-                        "multi_query_enabled": args.multi_query,
-                    },
+                payload = execute_case(
+                    client,
+                    case,
+                    experiment_id=experiment_id,
+                    multi_query=args.multi_query,
+                    agent_enabled=settings.agent_enabled,
                 )
-                response.raise_for_status()
-                payload = response.json()
                 annotate_sources(payload, config)
             except Exception as exc:
                 payload = {"answer": "", "sources": [], "metrics": {}, "error": str(exc)}
@@ -394,6 +557,19 @@ def evaluate(args: argparse.Namespace) -> int:
     dataset_parts = dataset_path.stem.rsplit("_", maxsplit=1)
     dataset_id = dataset_parts[0]
     dataset_version = dataset_parts[1] if len(dataset_parts) == 2 else "unversioned"
+    gold_statuses = {case.get("gold_status", "draft") for case in cases}
+    corpus_documents = []
+    for item in source_inventory:
+        indexed = indexed_by_name[item["filename"]]
+        corpus_documents.append(
+            {
+                **item,
+                "document_id": indexed["id"],
+                "indexed_chunk_count": indexed["chunks"],
+                "status": indexed["status"],
+                "active": indexed["active"],
+            }
+        )
     run = {
         "format_version": "clip-evaluation-run/v2",
         "experiment_id": experiment_id,
@@ -407,6 +583,9 @@ def evaluate(args: argparse.Namespace) -> int:
             "path": str(dataset_path.relative_to(ROOT)),
             "sha256": digest(dataset_path.read_bytes()),
             "case_count": len(cases),
+            "gold_status": (
+                next(iter(gold_statuses)) if len(gold_statuses) == 1 else "mixed"
+            ),
         },
         "corpus": {
             **corpus,
@@ -415,8 +594,11 @@ def evaluate(args: argparse.Namespace) -> int:
             "config_path": str(config_path.relative_to(ROOT)),
             "document_count": len(config["documents"]),
             "preparation": corpus_action,
+            "documents": corpus_documents,
         },
+        "mode": "agent" if settings.agent_enabled else "baseline",
         "models": {
+            "provider": settings.llm_default_provider,
             "llm": settings.ollama_model,
             "generation": {
                 "temperature": settings.ollama_temperature,
@@ -473,6 +655,11 @@ def main() -> int:
         help="Explicit corpus JSON; defaults to eval/corpora/<dataset stem>/corpus.json",
     )
     parser.add_argument("--output-dir", default="eval/results")
+    parser.add_argument(
+        "--mode",
+        choices=("baseline", "agent"),
+        help="Explicitly set the evaluation mode without changing .env",
+    )
     parser.add_argument(
         "--multi-query",
         action="store_true",

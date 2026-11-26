@@ -53,6 +53,10 @@ def _citation_numbers(answer: str) -> list[int]:
     return [int(value) for value in re.findall(r"\[(\d+)\]", answer)]
 
 
+def _unique_by_first(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
 def _fact_check(
     fact: dict[str, Any], answer: str, sources: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -86,15 +90,19 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
         {**item, "source_id": item.get("source_id") or source_id(item["filename"])}
         for item in response.get("sources", [])
     ]
-    retrieved = [item["source_id"] for item in sources]
+    retrieved_occurrences = [item["source_id"] for item in sources]
+    retrieved = _unique_by_first(retrieved_occurrences)
     expected = list(case["expected_sources"])
     expected_set = set(expected)
     expected_fragments = set(case.get("expected_fragments", []))
-    retrieved_fragments = [
-        fragment_id
+    retrieved_passages = [
+        passage_id
         for item in sources
-        for fragment_id in item.get("fragment_ids", [])
+        for passage_id in item.get("passage_ids", item.get("fragment_ids", []))
     ]
+    expected_passages = set(
+        case.get("expected_passages", case.get("expected_fragments", []))
+    )
 
     def recall_at(k: int) -> float | None:
         if not expected_set:
@@ -125,6 +133,40 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
 
         ideal_score = dcg(ideal)
         return dcg(gains) / ideal_score if ideal_score else None
+    def passage_recall_at(k: int) -> float | None:
+        if not expected_passages:
+            return None
+        covered = {
+            passage_id
+            for item in sources[:k]
+            for passage_id in item.get("passage_ids", item.get("fragment_ids", []))
+            if passage_id in expected_passages
+        }
+        return len(covered) / len(expected_passages)
+
+    def passage_precision_at(k: int) -> float | None:
+        if not expected_passages:
+            return None
+        relevant_slots = sum(
+            bool(
+                expected_passages.intersection(
+                    item.get("passage_ids", item.get("fragment_ids", []))
+                )
+            )
+            for item in sources[:k]
+        )
+        return relevant_slots / k
+
+    first_passage_rank = next(
+        (
+            rank
+            for rank, item in enumerate(sources, start=1)
+            if expected_passages.intersection(
+                item.get("passage_ids", item.get("fragment_ids", []))
+            )
+        ),
+        None,
+    )
     citation_numbers = _citation_numbers(answer)
     citations_present = bool(citation_numbers)
     citation_ids_admissible = all(
@@ -148,10 +190,71 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
     abstention_correct = (
         abstention_detected and forbidden_clear if should_abstain else not abstention_detected
     )
+    dialogue = response.get("dialogue") or {}
+    outcome = response.get("outcome")
+    initial_outcome = dialogue.get("initial_outcome", outcome)
+    final_outcome = dialogue.get("final_outcome", outcome)
+    expected_outcome = case.get(
+        "expected_outcome", "quality_review_required" if should_abstain else "answered"
+    )
+    expected_final_outcome = case.get("dialogue", {}).get(
+        "expected_final_outcome", expected_outcome
+    )
+    requires_clarification = bool(case.get("requires_clarification", False))
+    clarification_question = str(dialogue.get("clarification_question") or "")
+    clarification_success = (
+        initial_outcome == "clarification_required"
+        and "?" in clarification_question
+        and final_outcome == expected_final_outcome
+        if requires_clarification
+        else None
+    )
+    required_facts_coverage = (
+        sum(item["text_condition_met"] for item in required_checks) / len(required_checks)
+        if required_checks
+        else None
+    )
+    citation_fact_checks = [
+        item
+        for item, fact in zip(required_checks, case["required_facts"], strict=True)
+        if fact.get("citation_required")
+    ]
+    citation_support_rate = (
+        sum(bool(item["citation_condition_met"]) for item in citation_fact_checks)
+        / len(citation_fact_checks)
+        if citation_fact_checks
+        else None
+    )
+    forbidden_claims_rate = (
+        sum(item["detected"] for item in forbidden_checks) / len(forbidden_checks)
+        if forbidden_checks
+        else 0.0
+    )
+    expected_answered = expected_final_outcome == "answered"
+    grounded_answer = (
+        final_outcome == "answered"
+        and (all(item["passed"] for item in required_checks) if required_checks else True)
+        and forbidden_clear
+        and citation_ids_valid
+        if expected_answered
+        else None
+    )
+    correct_abstention = (
+        final_outcome in {"quality_review_required", "conflict_detected"}
+        and forbidden_clear
+        if should_abstain
+        else None
+    )
+    conflict_handling_quality = (
+        final_outcome == "conflict_detected" and forbidden_clear
+        if expected_final_outcome == "conflict_detected"
+        else None
+    )
     manual_review_required = bool(
         case.get("manual_review_required", False)
         or case["category"] in {"multi_document", "conflict", "insufficient_data"}
         or should_abstain
+        or case.get("gold_status", "draft") != "approved"
     )
     metrics = response.get("metrics", {})
     return {
@@ -161,6 +264,9 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
         "answer": answer,
         "expected_sources": expected,
         "retrieved_sources": retrieved,
+        "retrieved_source_occurrences": retrieved_occurrences,
+        "expected_passages": sorted(expected_passages),
+        "retrieved_passages": _unique_by_first(retrieved_passages),
         "retrieved_documents": [
             {
                 "rank": rank,
@@ -174,6 +280,8 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
                 "rank_before_rerank": item.get("rank_before_rerank"),
                 "rank_after_rerank": item.get("rank_after_rerank"),
                 "fragment_ids": item.get("fragment_ids", []),
+                "passage_ids": item.get("passage_ids", item.get("fragment_ids", [])),
+                "retrieval_passage_id": item.get("retrieval_passage_id"),
             }
             for rank, item in enumerate(sources, start=1)
         ],
@@ -188,15 +296,27 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "document_precision_at_5": precision_at(5),
             "document_precision_at_8": precision_at(8),
             "mrr": 1 / first_rank if first_rank else (0.0 if expected_set else None),
+            "ndcg_at_3": ndcg_at(3),
             "ndcg_at_5": ndcg_at(5),
             "expected_document_coverage": recall_at(len(retrieved)),
             "all_required_sources_at_8": (
                 expected_set.issubset(set(retrieved[:8])) if expected_set else None
             ),
             "expected_fragment_coverage": (
-                len(expected_fragments.intersection(retrieved_fragments)) / len(expected_fragments)
+                len(expected_fragments.intersection(retrieved_passages)) / len(expected_fragments)
                 if expected_fragments
                 else None
+            ),
+            "passage_recall_at_1": passage_recall_at(1),
+            "passage_recall_at_3": passage_recall_at(3),
+            "passage_recall_at_5": passage_recall_at(5),
+            "passage_recall_at_8": passage_recall_at(8),
+            "passage_precision_at_3": passage_precision_at(3),
+            "passage_precision_at_5": passage_precision_at(5),
+            "passage_mrr": (
+                1 / first_passage_rank
+                if first_passage_rank
+                else (0.0 if expected_passages else None)
             ),
             "citation_numbers": citation_numbers,
             "citations_present": citations_present,
@@ -206,11 +326,21 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "required_facts_passed": (
                 all(item["passed"] for item in required_checks) if required_checks else None
             ),
+            "required_facts_coverage": required_facts_coverage,
+            "citation_support_rate": citation_support_rate,
             "forbidden_claims": forbidden_checks,
             "forbidden_claims_clear": forbidden_clear,
+            "forbidden_claims_rate": forbidden_claims_rate,
             "should_abstain": should_abstain,
             "abstention_detected": abstention_detected,
             "abstention_correct": abstention_correct,
+            "correct_abstention": correct_abstention,
+            "grounded_answer": grounded_answer,
+            "outcome": final_outcome,
+            "expected_outcome": expected_final_outcome,
+            "outcome_correct": final_outcome == expected_final_outcome,
+            "clarification_success": clarification_success,
+            "conflict_handling_quality": conflict_handling_quality,
             "latency_ms": metrics.get("latency_ms"),
             "input_tokens": metrics.get("prompt_tokens"),
             "output_tokens": metrics.get("completion_tokens"),
@@ -231,6 +361,11 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
         ),
         "error": response.get("error"),
         "notes": case["notes"],
+        "gold_status": case.get("gold_status", "draft"),
+        "reviewer": case.get("reviewer"),
+        "reviewed_at": case.get("reviewed_at"),
+        "dialogue": dialogue or None,
+        "trace_ids": dialogue.get("trace_ids", [response.get("trace_id")]),
     }
 
 
@@ -267,12 +402,20 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "document_precision_at_5": _mean(values("document_precision_at_5")),
         "document_precision_at_8": _mean(values("document_precision_at_8")),
         "mrr": _mean(values("mrr")),
+        "ndcg_at_3": _mean(values("ndcg_at_3")),
         "ndcg_at_5": _mean(values("ndcg_at_5")),
         "expected_document_coverage": _mean(values("expected_document_coverage")),
         "all_required_sources_at_8_rate": _mean(
             [float(v) for v in values("all_required_sources_at_8")]
         ),
         "expected_fragment_coverage": _mean(values("expected_fragment_coverage")),
+        "passage_recall_at_1": _mean(values("passage_recall_at_1")),
+        "passage_recall_at_3": _mean(values("passage_recall_at_3")),
+        "passage_recall_at_5": _mean(values("passage_recall_at_5")),
+        "passage_recall_at_8": _mean(values("passage_recall_at_8")),
+        "passage_precision_at_3": _mean(values("passage_precision_at_3")),
+        "passage_precision_at_5": _mean(values("passage_precision_at_5")),
+        "passage_mrr": _mean(values("passage_mrr")),
         "citation_ids_valid_rate": _mean([float(v) for v in values("citation_ids_valid")]),
         "citations_present_rate": _mean([float(v) for v in values("citations_present")]),
         "citation_ids_admissible_rate": _mean(
@@ -281,15 +424,29 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "required_facts_pass_rate": _mean(
             [float(v) for v in values("required_facts_passed")]
         ),
+        "required_facts_coverage": _mean(values("required_facts_coverage")),
+        "citation_support_rate": _mean(values("citation_support_rate")),
         "forbidden_claims_clear_rate": _mean(
             [float(v) for v in values("forbidden_claims_clear")]
         ),
+        "forbidden_claims_rate": _mean(values("forbidden_claims_rate")),
         "abstention_accuracy": _mean(
             [
                 float(item["metrics"]["abstention_correct"])
                 for item in results
                 if item.get("error") is None and item["metrics"]["should_abstain"]
             ]
+        ),
+        "correct_abstention_rate": _mean(
+            [float(v) for v in values("correct_abstention")]
+        ),
+        "grounded_answer_rate": _mean([float(v) for v in values("grounded_answer")]),
+        "outcome_accuracy": _mean([float(v) for v in values("outcome_correct")]),
+        "clarification_quality": _mean(
+            [float(v) for v in values("clarification_success")]
+        ),
+        "conflict_handling_quality": _mean(
+            [float(v) for v in values("conflict_handling_quality")]
         ),
         "manual_review_count": sum(item["manual_review_required"] for item in results),
         "latency_ms": {
@@ -314,20 +471,48 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             "llm_mean": _mean(values("agent_llm_calls")),
             "steps_mean": _mean(values("agent_steps")),
         },
+        "denominators": {
+            name: len(values(name))
+            for name in (
+                "document_recall_at_1",
+                "document_precision_at_3",
+                "passage_recall_at_5",
+                "passage_precision_at_5",
+                "mrr",
+                "ndcg_at_3",
+                "grounded_answer",
+                "citation_support_rate",
+                "correct_abstention",
+                "clarification_success",
+                "conflict_handling_quality",
+            )
+        },
+        "aggregation": {
+            "rule": "macro mean over completed applicable cases",
+            "precision_short_list_denominator": "fixed K",
+            "empty_gold": "not_applicable",
+            "document_ranking": "unique source_id by first appearance",
+            "passage_ranking": "retrieval slots with stable gold passage coverage",
+        },
     }
 
 
 def compare_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "document_recall_at_1", "document_recall_at_3", "document_recall_at_5",
-        "document_recall_at_8", "mrr", "ndcg_at_5", "expected_document_coverage",
+        "document_recall_at_8", "mrr", "ndcg_at_3", "ndcg_at_5", "expected_document_coverage",
         "document_precision_at_1", "document_precision_at_3",
         "document_precision_at_5", "document_precision_at_8",
         "all_required_sources_at_8_rate", "expected_fragment_coverage",
+        "passage_recall_at_1", "passage_recall_at_3", "passage_recall_at_5",
+        "passage_recall_at_8", "passage_precision_at_3", "passage_precision_at_5",
+        "passage_mrr",
         "citations_present_rate",
         "citation_ids_admissible_rate", "citation_ids_valid_rate",
         "required_facts_pass_rate", "forbidden_claims_clear_rate",
-        "abstention_accuracy",
+        "required_facts_coverage", "citation_support_rate", "forbidden_claims_rate",
+        "abstention_accuracy", "correct_abstention_rate", "grounded_answer_rate",
+        "outcome_accuracy", "clarification_quality", "conflict_handling_quality",
     )
     left_summary, right_summary = left["summary"], right["summary"]
     metrics: dict[str, Any] = {}

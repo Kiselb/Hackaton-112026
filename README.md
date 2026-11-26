@@ -172,7 +172,7 @@ Set-Location ..
 .\.venv\Scripts\python.exe scripts\smoke_test.py --model qwen3.5:9b --output smoke-results-qwen.json
 ```
 
-## Evaluation Lab (CLIP-003—005)
+## Evaluation Lab (CLIP-003—017)
 
 Воспроизводимый baseline на 18 вручную сверенных сценариях запускается без отдельного
 backend-процесса:
@@ -192,8 +192,7 @@ $env:RERANK_MODEL_REVISION='953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e'
 .\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v2.jsonl
 
 $env:RERANK_ENABLED='false'
-$env:AGENT_ENABLED='true'
-.\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v2.jsonl
+.\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v2.jsonl --mode agent
 ```
 
 Runner использует отдельные PostgreSQL schema, Qdrant collection, OpenSearch index и
@@ -202,6 +201,12 @@ run.json, cases.jsonl и report.md в исключённом из Git катал
 Run v2 также сохраняет SHA-256 фактического source tree и dirty-status, поэтому
 незакоммиченный эксперимент нельзя спутать с чистым HEAD.
 Сравнение двух прогонов: scripts/evaluate.py --compare RUN_A RUN_B.
+
+CLIP-017 добавляет DOCX/table extraction, passage-level gold, multi-turn cases и явные
+режимы `--mode baseline`, `--mode agent`, `--mode agent --multi-query`. Набор из 36
+кейсов на четырёх регламентах имеет статус draft до внешнего экспертного review;
+фактические результаты и блокирующий дефект агента описаны в
+[docs/CLIP017_EVALUATION_REPORT.md](docs/CLIP017_EVALUATION_REPORT.md).
 
 Методика: [docs/EVALUATION_LAB.md](docs/EVALUATION_LAB.md). Протокол:
 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md). Фактический baseline:

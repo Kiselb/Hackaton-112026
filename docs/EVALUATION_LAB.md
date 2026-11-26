@@ -2,9 +2,9 @@
 
 ## Назначение
 
-Контур фиксирует baseline и контролируемые эксперименты single-query hybrid RAG.
-MultiQuery, LangGraph и LLM Judge отсутствуют; reranking доступен за флагом. Набор
-eval/datasets/corporate_v1.jsonl содержит 18 сценариев,
+Контур фиксирует baseline и контролируемые эксперименты hybrid RAG, Strict Agent и
+Strict Agent с Multi-Query. Reranking доступен за отдельным флагом; внешний LLM Judge
+намеренно отсутствует. Набор eval/datasets/corporate_v1.jsonl содержит 18 сценариев,
 вручную сверенных с синтетическими файлами examples/. Идентификаторы источников имеют
 вид example:order_101 и не зависят от UUID, создаваемых ingestion.
 
@@ -19,9 +19,10 @@ eval/datasets/corporate_v1.jsonl содержит 18 сценариев,
 
     .\.venv\Scripts\python.exe scripts\evaluate.py --dataset eval/datasets/corporate_v1.jsonl
 
-Runner проверяет /readyz и наличие модели Ollama, индексирует четыре документа при
-первом запуске, затем последовательно вызывает тот же /api/v1/ask, который является
-baseline приложения.
+Runner проверяет /readyz и наличие модели Ollama, индексирует документы при первом
+запуске, затем последовательно вызывает тот же /api/v1/ask, что и приложение. Режим
+задаётся явно: `--mode baseline`, `--mode agent` либо `--mode agent --multi-query`.
+Baseline вместе с `--multi-query` отклоняется, чтобы конфигурации не смешивались.
 
 Для CLIP-005 добавлен независимый corporate_v2: 26 документов в
 eval/corpora/corporate_v2/documents, явный corpus.json и 36 вопросов. В manifest
@@ -105,6 +106,28 @@ reranking смогут писать те же поля и сравниватьс
 Меняется только RERANK_ENABLED; model ID/revision, corpus/dataset SHA, retrieval и
 generation settings должны совпадать. Фактический вывод и ограничения находятся в
 docs/reports/CLIP005_RERANKING.md.
+
+## CLIP-017: DOCX и passage gold
+
+Corpus config может ссылаться на DOCX, PDF, Markdown и plain text. Для DOCX gold-цитаты
+проверяются против того же extraction, который использует ingestion: абзацы и таблицы
+сохраняются в порядке документа, строки таблицы сериализуются через ` | `. Inventory
+фиксирует размер и SHA-256 исходника, успешность extraction, число символов, ожидаемое
+и фактическое число чанков.
+
+Passage-level gold хранит устойчивые `passage_id`, точную цитату, секцию, релевантность
+и условия применения. Runtime passage ID зависит от устойчивого source ID и
+нормализованного parent context, а не от случайного UUID child chunk. Метрики включают
+Passage Recall@1/@3/@5/@8, Precision@3/@5 и Passage MRR.
+
+Multi-turn case может содержать заранее размеченный `dialogue.user_reply`. Runner
+сохраняет conversation token между ходами, оба trace ID, начальный и финальный outcome,
+суммарные latency/tokens/calls. Разметка `draft` не становится утверждённой из-за
+успешного прогона: reviewer и reviewed_at должны быть заполнены внешним экспертом.
+
+Команды реального CLIP-017 запускаются только с изолированным corpus config и
+process-only offline-флагами для уже установленной BGE-M3. Итоги и ограничения
+зафиксированы в `docs/CLIP017_EVALUATION_REPORT.md`.
 
 ## Сравнение
 
