@@ -59,6 +59,7 @@ question + user_id + session_id
     -> deterministic input guard (language, meaningfulness, scope, injection)
     -> AGENT_ENABLED=false: strict single-query RAG
     -> AGENT_ENABLED=true (default for new configs): LangGraph
+         -> optional deterministic glossary expansion of the current resolved query
          route_and_plan (simple fast route or one bounded JSON plan)
               -> optional request-level Multi-Query expansion in the same structured call
          -> retrieve per formulation (existing BGE-M3 + BM25 + RRF + SQL visibility + optional rerank)
@@ -141,6 +142,13 @@ LLM calls by default. The only graph loop is
 `assess_evidence -> targeted_retrieve -> assess_evidence`; retry/search budgets and
 LangGraph recursion limit make it finite. State is request-local and is not long-term or
 shared memory.
+
+Glossary-aware understanding is an independent deterministic preprocessing step after
+conversation/reference resolution and before planning. A validated private JSON maps
+whole-token aliases to approved expansions; ambiguous entries require declared lexical
+context. The retrieval form retains the acronym in parentheses, while the raw user text
+and pre-glossary `resolved_query` remain in the trace. The glossary is never evidence and
+adds no retrieval/LLM call. Invalid enabled configuration fails closed before search.
 
 The same turn-scoped LLM session is used for planning, evidence assessment, answer
 composition, citation repair and grounding validation. OpenAI uses the Responses API with

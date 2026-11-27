@@ -18,6 +18,8 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - опциональный локальный CrossEncoder reranking после проверки активности;
 - bounded AI-Агент по умолчанию с input guardrails, evidence assessment и fail-closed answer validation;
 - request-level Multi-Query для AI-Агента: безопасное query expansion, межзапросный RRF и прозрачные затраты;
+- опциональное детерминированное раскрытие сокращений из валидируемого локального
+  глоссария перед agent retrieval, без добавления evidence или поисковых вызовов;
 - request-level выбор локального Ollama или OpenAI Responses API с единым LLM-интерфейсом;
 - stateful-уточнения с PostgreSQL-историей, повторным retrieval и изоляцией диалогов;
 - подтверждаемая пользователем эскалация в службу качества, безопасный SMTP и
@@ -82,6 +84,12 @@ Multi-Query разрешён сервером через `MULTI_QUERY_ENABLED=tr
 включает исходный вопрос. Переключатель доступен в поиске только для AI-Агента; лимиты
 agent search/LLM остаются общими и обязательная grounding validation не жертвуется ради
 расширения: [docs/CLIP016_MULTI_QUERY.md](docs/CLIP016_MULTI_QUERY.md).
+
+Glossary-Aware Query Understanding выключен по умолчанию (`GLOSSARY_ENABLED=false`).
+Приватный словарь загружается из `GLOSSARY_PATH`, целиком валидируется с SHA-256 и не
+становится источником ответа. Реальная A/B-оценка v1 показала смешанный retrieval-эффект
+и ухудшение answer-quality proxies, поэтому включение на публичном стенде не
+рекомендуется: [docs/CLIP018B_GLOSSARY.md](docs/CLIP018B_GLOSSARY.md).
 
 LLM по умолчанию остаётся `ollama`/`qwen3.5:9b`. Опциональный OpenAI включается только
 backend-настройками, использует Responses API с `store=false` и серверный allowlist

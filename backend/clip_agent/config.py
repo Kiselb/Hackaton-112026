@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     multi_query_enabled: bool = True
     multi_query_default_enabled: bool = False
     multi_query_max_variants: int = Field(default=2, ge=1, le=5)
+    glossary_enabled: bool = False
+    glossary_path: Path = Path("storage/glossary/customer_v1.json")
     agent_demo_override_enabled: bool = False
     conversation_ttl_minutes: int = Field(default=60, ge=5, le=1440)
     conversation_max_clarifications: int = Field(default=2, ge=1, le=5)

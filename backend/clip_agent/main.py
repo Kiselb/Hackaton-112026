@@ -65,6 +65,11 @@ from .db import (
 )
 from .extract import extract_text
 from .guardrails import assess_clarification_answer, assess_input
+from .glossary import (
+    GlossaryConfigError,
+    disabled_expansion,
+    get_glossary_expander,
+)
 from .load_control import RequestGate, slot_dependency
 from .llm import (
     LlmProviderError,
@@ -127,6 +132,8 @@ def acquire_ingest_slot():
 @app.on_event("startup")
 def startup() -> None:
     settings.storage_root.mkdir(parents=True, exist_ok=True)
+    if settings.glossary_enabled:
+        get_glossary_expander(str(settings.glossary_path))
     init_db()
 
 
@@ -178,6 +185,9 @@ def capabilities() -> dict:
             "available": settings.multi_query_enabled,
             "default_enabled": settings.multi_query_default_enabled,
             "max_variants": settings.multi_query_max_variants,
+        },
+        "glossary": {
+            "enabled": settings.glossary_enabled,
         },
     }
 
@@ -686,9 +696,56 @@ def ask(
                 )
         db.commit()
 
+    resolved_question = effective_question
+    glossary_expansion = disabled_expansion(resolved_question)
+    if use_agent and settings.glossary_enabled:
+        try:
+            glossary_expansion = get_glossary_expander(
+                str(settings.glossary_path)
+            ).expand(resolved_question)
+        except GlossaryConfigError as exc:
+            conversation_details = {
+                **_conversation_trace_details(
+                    conversation, user_turn, resolved_question
+                ),
+                **multi_query_trace_defaults,
+                **disabled_expansion(resolved_question).trace_details(),
+                "glossary_enabled": True,
+                "glossary_status": "configuration_error",
+                "glossary_error_code": exc.code,
+            }
+            result = _finish_controlled(
+                db,
+                trace,
+                started,
+                mode=mode,
+                outcome="technical_error",
+                reason_code="glossary_configuration_error",
+                answer=(
+                    "Конфигурация корпоративного глоссария не прошла проверку. "
+                    "Поиск и неподтверждённый ответ не выполнялись. Обратитесь к владельцу системы."
+                ),
+                agent_enabled=True,
+                details=conversation_details,
+                llm=llm,
+            )
+            return _finalize_conversation_result(
+                db,
+                conversation,
+                trace,
+                result,
+                selection.provider,
+                selection.model,
+                response=response,
+                issued_token=issued_token,
+                preserve_awaiting=clarification_follow_up,
+            )
+    effective_question = glossary_expansion.search_query
     conversation_details = {
-        **_conversation_trace_details(conversation, user_turn, effective_question),
+        **_conversation_trace_details(conversation, user_turn, resolved_question),
         **multi_query_trace_defaults,
+        **glossary_expansion.trace_details(),
+        "glossary_status": "applied" if glossary_expansion.used else "no_change",
     }
     if input_assessment is not None and not input_assessment.allowed:
         result = _finish_controlled(
@@ -947,6 +1004,25 @@ def ask(
                 ),
                 "multi_query_fallback_reason": details.get(
                     "multi_query_fallback_reason"
+                ),
+                "glossary_used": conversation_details.get("glossary_used", False),
+                "glossary_query_changed": conversation_details.get(
+                    "glossary_query_changed", False
+                ),
+                "glossary_found_terms": conversation_details.get(
+                    "glossary_found_terms", 0
+                ),
+                "glossary_applied_expansions": conversation_details.get(
+                    "glossary_applied_expansions", 0
+                ),
+                "glossary_skipped_expansions": conversation_details.get(
+                    "glossary_skipped_expansions", 0
+                ),
+                "glossary_additional_retrieval_calls": conversation_details.get(
+                    "glossary_additional_retrieval_calls", 0
+                ),
+                "glossary_latency_ms": conversation_details.get(
+                    "glossary_latency_ms", 0.0
                 ),
             },
         }

@@ -348,6 +348,11 @@ def _combined_metrics(*payloads: dict[str, Any]) -> dict[str, Any]:
         "assessment_malformed_responses",
         "assessment_empty_responses",
         "assessment_truncated_responses",
+        "glossary_found_terms",
+        "glossary_applied_expansions",
+        "glossary_skipped_expansions",
+        "glossary_additional_retrieval_calls",
+        "glossary_latency_ms",
     ):
         values = [item.get(key) for item in metrics if item.get(key) is not None]
         summed[key] = sum(values) if values else None
@@ -361,6 +366,12 @@ def _combined_metrics(*payloads: dict[str, Any]) -> dict[str, Any]:
                     "multi_query_unique_sources",
                 )
             }
+        )
+        summed["glossary_used"] = any(
+            bool(item.get("glossary_used")) for item in metrics
+        )
+        summed["glossary_query_changed"] = any(
+            bool(item.get("glossary_query_changed")) for item in metrics
         )
     return summed
 
@@ -472,7 +483,8 @@ def report_markdown(run: dict[str, Any], results: list[dict[str, Any]]) -> str:
         f"Dirty worktree: **{run['source_state']['dirty']}**  ",
         f"Corpus SHA-256: `{run['corpus']['hash']}`  ",
         f"Gold status: **{run['dataset']['gold_status']}**  ",
-        f"Mode: **{run['mode']}** / Multi-Query: **{run['agent']['multi_query_requested']}**",
+        f"Mode: **{run['mode']}** / Multi-Query: **{run['agent']['multi_query_requested']}** / "
+        f"Glossary: **{run.get('glossary', {}).get('enabled', False)}**",
         "", "## Corpus", "",
         "| Source | Bytes | SHA-256 | Extracted chars | Chunks | Document ID |",
         "|---|---:|---|---:|---:|---|",
@@ -533,9 +545,12 @@ def evaluate(args: argparse.Namespace) -> int:
         raise RuntimeError(f"Python 3.12 is required, got {platform.python_version()}")
     if args.mode == "baseline" and args.multi_query:
         raise ValueError("Multi-Query cannot be requested in baseline mode")
+    if args.mode == "baseline" and args.glossary:
+        raise ValueError("Glossary-aware query understanding is agent-only")
     if args.mode:
         os.environ["AGENT_ENABLED"] = str(args.mode == "agent").lower()
     os.environ["QUALITY_EMAIL_ENABLED"] = "false"
+    os.environ["GLOSSARY_ENABLED"] = str(bool(args.glossary)).lower()
     dataset_path = Path(args.dataset).resolve()
     config_path = (
         Path(args.corpus_config).resolve()
@@ -553,10 +568,19 @@ def evaluate(args: argparse.Namespace) -> int:
     from fastapi.testclient import TestClient
 
     from clip_agent.config import get_settings
+    from clip_agent.glossary import get_glossary_expander
     from clip_agent.main import app
     from clip_agent.reranking import reranker_runtime_metadata
 
     settings = get_settings()
+    if args.glossary and not settings.agent_enabled:
+        raise ValueError("Glossary-aware query understanding is agent-only")
+    glossary_metadata: dict[str, Any] = {"enabled": settings.glossary_enabled}
+    if settings.glossary_enabled:
+        glossary = get_glossary_expander(str(settings.glossary_path)).document
+        glossary_metadata.update(
+            {"version": glossary.version, "sha256": glossary.content_sha256}
+        )
     started = datetime.now().astimezone()
     commit_sha = git_sha()
     actual_source = source_state()
@@ -683,6 +707,7 @@ def evaluate(args: argparse.Namespace) -> int:
             "multi_query_requested": args.multi_query,
             "multi_query_max_variants": settings.multi_query_max_variants,
         },
+        "glossary": glossary_metadata,
         "readiness": ready,
         "summary": aggregate_results(results),
         "artifacts": {"cases": "cases.jsonl", "report": "report.md"},
@@ -714,6 +739,11 @@ def main() -> int:
         "--multi-query",
         action="store_true",
         help="Request Multi-Query for every AI-Agent case in this run",
+    )
+    parser.add_argument(
+        "--glossary",
+        action="store_true",
+        help="Enable the configured local glossary for every AI-Agent case in this run",
     )
     parser.add_argument("--compare", nargs=2, metavar=("LEFT_RUN", "RIGHT_RUN"))
     parser.add_argument("--comparison-output", type=Path)

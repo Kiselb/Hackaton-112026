@@ -137,6 +137,35 @@ def test_aggregate_and_comparison_are_deterministic():
     assert comparison["metrics"]["mrr"]["delta"] == 0.5
 
 
+def test_glossary_evaluation_tracks_false_expansion_and_cost():
+    payload = response()
+    payload["metrics"].update(
+        {
+            "glossary_used": True,
+            "glossary_query_changed": True,
+            "glossary_found_terms": 1,
+            "glossary_applied_expansions": 1,
+            "glossary_skipped_expansions": 0,
+            "glossary_additional_retrieval_calls": 0,
+            "glossary_latency_ms": 0.25,
+        }
+    )
+    result = evaluate_case(case(glossary_should_expand=False), payload)
+    summary = aggregate_results([result])
+
+    assert result["metrics"]["false_glossary_expansion"] is True
+    assert summary["glossary"] == {
+        "used_cases": 1,
+        "found_terms_total": 1,
+        "applied_expansions_total": 1,
+        "skipped_expansions_total": 0,
+        "false_expansion_rate": 1.0,
+        "additional_retrieval_calls_total": 0,
+        "latency_ms_mean": 0.25,
+        "latency_ms_total": 0.25,
+    }
+
+
 def test_ndcg_fragment_and_all_source_coverage():
     multi = case(
         expected_sources=["example:order_101", "example:agency_contract"],

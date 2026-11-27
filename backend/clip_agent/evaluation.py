@@ -257,6 +257,13 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
         or case.get("gold_status", "draft") != "approved"
     )
     metrics = response.get("metrics", {})
+    glossary_should_expand = case.get("glossary_should_expand")
+    glossary_used = bool(metrics.get("glossary_used", False))
+    false_glossary_expansion = (
+        glossary_used and not glossary_should_expand
+        if glossary_should_expand is not None
+        else None
+    )
     return {
         "case_id": case["case_id"],
         "question": case["question"],
@@ -351,6 +358,21 @@ def evaluate_case(case: dict[str, Any], response: dict[str, Any]) -> dict[str, A
             "multi_query_effective": metrics.get("multi_query_effective", False),
             "multi_query_search_calls": metrics.get("multi_query_search_calls", 0),
             "multi_query_unique_sources": metrics.get("multi_query_unique_sources", 0),
+            "glossary_used": glossary_used,
+            "glossary_query_changed": metrics.get("glossary_query_changed", False),
+            "glossary_found_terms": metrics.get("glossary_found_terms", 0),
+            "glossary_applied_expansions": metrics.get(
+                "glossary_applied_expansions", 0
+            ),
+            "glossary_skipped_expansions": metrics.get(
+                "glossary_skipped_expansions", 0
+            ),
+            "glossary_additional_retrieval_calls": metrics.get(
+                "glossary_additional_retrieval_calls", 0
+            ),
+            "glossary_latency_ms": metrics.get("glossary_latency_ms", 0),
+            "glossary_should_expand": glossary_should_expand,
+            "false_glossary_expansion": false_glossary_expansion,
             "assessment_latency_ms": metrics.get("assessment_latency_ms", 0),
             "assessment_malformed_responses": metrics.get(
                 "assessment_malformed_responses", 0
@@ -482,6 +504,20 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 values("assessment_truncated_responses")
             ),
         },
+        "glossary": {
+            "used_cases": sum(bool(v) for v in values("glossary_used")),
+            "found_terms_total": sum(values("glossary_found_terms")),
+            "applied_expansions_total": sum(values("glossary_applied_expansions")),
+            "skipped_expansions_total": sum(values("glossary_skipped_expansions")),
+            "false_expansion_rate": _mean(
+                [float(v) for v in values("false_glossary_expansion")]
+            ),
+            "additional_retrieval_calls_total": sum(
+                values("glossary_additional_retrieval_calls")
+            ),
+            "latency_ms_mean": _mean(values("glossary_latency_ms")),
+            "latency_ms_total": round(sum(values("glossary_latency_ms")), 4),
+        },
         "tokens": {
             "input_total": sum(values("input_tokens")),
             "output_total": sum(values("output_tokens")),
@@ -536,7 +572,8 @@ def compare_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
         "required_facts_pass_rate", "forbidden_claims_clear_rate",
         "required_facts_coverage", "citation_support_rate", "forbidden_claims_rate",
         "abstention_accuracy", "correct_abstention_rate", "grounded_answer_rate",
-        "outcome_accuracy", "clarification_quality", "conflict_handling_quality",
+        "outcome_accuracy", "technical_error_rate", "clarification_quality",
+        "conflict_handling_quality",
     )
     left_summary, right_summary = left["summary"], right["summary"]
     metrics: dict[str, Any] = {}
@@ -562,6 +599,22 @@ def compare_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
         "right": after,
         "delta": round(after - before, 4) if before is not None and after is not None else None,
     }
+    for key in (
+        "false_expansion_rate",
+        "additional_retrieval_calls_total",
+        "latency_ms_mean",
+    ):
+        before = left_summary.get("glossary", {}).get(key)
+        after = right_summary.get("glossary", {}).get(key)
+        metrics[f"glossary_{key}"] = {
+            "left": before,
+            "right": after,
+            "delta": (
+                round(after - before, 4)
+                if before is not None and after is not None
+                else None
+            ),
+        }
     for key in ("search_mean", "llm_mean", "steps_mean"):
         before = left_summary.get("agent_calls", {}).get(key)
         after = right_summary.get("agent_calls", {}).get(key)
