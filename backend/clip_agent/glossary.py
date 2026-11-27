@@ -118,6 +118,7 @@ class GlossaryExpansion:
     applied_count: int
     skipped_count: int
     skip_reasons: dict[str, int]
+    matches: tuple[tuple[str, str, str], ...]
     latency_ms: float
 
     @property
@@ -138,6 +139,10 @@ class GlossaryExpansion:
             "glossary_applied_expansions": self.applied_count,
             "glossary_skipped_expansions": self.skipped_count,
             "glossary_skip_reasons": self.skip_reasons,
+            "glossary_matches": [
+                {"abbreviation": abbreviation, "expansion": expansion, "status": status}
+                for abbreviation, expansion, status in self.matches
+            ],
             "glossary_latency_ms": self.latency_ms,
             "glossary_query_changed": self.changed,
             "glossary_search_query": self.search_query,
@@ -156,6 +161,7 @@ def disabled_expansion(query: str) -> GlossaryExpansion:
         applied_count=0,
         skipped_count=0,
         skip_reasons={},
+        matches=(),
         latency_ms=0.0,
     )
 
@@ -203,6 +209,7 @@ class GlossaryExpander:
         normalized_query = " ".join(query.split()).casefold()
         applied_terms: set[str] = set()
         reasons: Counter[str] = Counter()
+        glossary_matches: list[tuple[str, str, str]] = []
         replacements: list[tuple[int, int, str]] = []
         for match in matches:
             matched = match.group(0)
@@ -210,27 +217,48 @@ class GlossaryExpander:
             term_key = term.abbreviation.casefold()
             if term.case_sensitive and matched != declared_alias:
                 reasons["case_sensitive_term"] += 1
+                glossary_matches.append(
+                    (term.abbreviation, term.expansion, "case_sensitive_term")
+                )
                 continue
             if term.expansion.casefold() in normalized_query:
                 reasons["already_expanded"] += 1
+                glossary_matches.append(
+                    (term.abbreviation, term.expansion, "already_expanded")
+                )
                 continue
             if term_key in applied_terms:
                 reasons["repeated_term"] += 1
+                glossary_matches.append(
+                    (term.abbreviation, term.expansion, "repeated_term")
+                )
                 continue
             if term.ambiguous and not any(
                 marker in normalized_query for marker in term.context_terms
             ):
                 reasons["ambiguous_without_context"] += 1
+                glossary_matches.append(
+                    (term.abbreviation, term.expansion, "ambiguous_without_context")
+                )
                 continue
             replacement = f"{term.expansion} ({term.abbreviation})"
             replacements.append((match.start(), match.end(), replacement))
             applied_terms.add(term_key)
+            glossary_matches.append((term.abbreviation, term.expansion, "applied"))
 
         expanded = query
         for start, end, replacement in reversed(replacements):
             expanded = f"{expanded[:start]}{replacement}{expanded[end:]}"
         if len(expanded) > MAX_EXPANDED_QUERY_CHARS:
             reasons["expanded_query_too_long"] += len(replacements)
+            glossary_matches = [
+                (
+                    abbreviation,
+                    expansion,
+                    "expanded_query_too_long" if status == "applied" else status,
+                )
+                for abbreviation, expansion, status in glossary_matches
+            ]
             replacements = []
             expanded = query
         return self._result(
@@ -239,6 +267,7 @@ class GlossaryExpander:
             found=len(matches),
             applied=len(replacements),
             reasons=reasons,
+            matches=tuple(glossary_matches),
             started=started,
         )
 
@@ -250,6 +279,7 @@ class GlossaryExpander:
         applied: int,
         reasons: Counter[str],
         started: float,
+        matches: tuple[tuple[str, str, str], ...] = (),
     ) -> GlossaryExpansion:
         return GlossaryExpansion(
             original_query=original,
@@ -261,6 +291,7 @@ class GlossaryExpander:
             applied_count=applied,
             skipped_count=sum(reasons.values()),
             skip_reasons=dict(sorted(reasons.items())),
+            matches=matches,
             latency_ms=round((time.perf_counter() - started) * 1000, 3),
         )
 

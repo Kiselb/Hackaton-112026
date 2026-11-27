@@ -551,6 +551,7 @@ def evaluate(args: argparse.Namespace) -> int:
         os.environ["AGENT_ENABLED"] = str(args.mode == "agent").lower()
     os.environ["QUALITY_EMAIL_ENABLED"] = "false"
     os.environ["GLOSSARY_ENABLED"] = str(bool(args.glossary)).lower()
+    os.environ["GLOSSARY_MODE"] = args.glossary_mode
     dataset_path = Path(args.dataset).resolve()
     config_path = (
         Path(args.corpus_config).resolve()
@@ -575,7 +576,10 @@ def evaluate(args: argparse.Namespace) -> int:
     settings = get_settings()
     if args.glossary and not settings.agent_enabled:
         raise ValueError("Glossary-aware query understanding is agent-only")
-    glossary_metadata: dict[str, Any] = {"enabled": settings.glossary_enabled}
+    glossary_metadata: dict[str, Any] = {
+        "enabled": settings.glossary_enabled,
+        "mode": settings.glossary_mode,
+    }
     if settings.glossary_enabled:
         glossary = get_glossary_expander(str(settings.glossary_path)).document
         glossary_metadata.update(
@@ -744,6 +748,12 @@ def main() -> int:
         "--glossary",
         action="store_true",
         help="Enable the configured local glossary for every AI-Agent case in this run",
+    )
+    parser.add_argument(
+        "--glossary-mode",
+        choices=("retrieval_only", "legacy_agent_query"),
+        default="retrieval_only",
+        help="Choose isolated retrieval-only expansion or reproduce legacy CLIP-018B behavior",
     )
     parser.add_argument("--compare", nargs=2, metavar=("LEFT_RUN", "RIGHT_RUN"))
     parser.add_argument("--comparison-output", type=Path)

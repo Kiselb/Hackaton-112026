@@ -155,6 +155,7 @@ def _evidence_assessment_schema(
 class AgentState(TypedDict, total=False):
     request_id: str
     question: str
+    retrieval_query: str
     user_id: str
     session_id: str
     plan: list[dict[str, str]]
@@ -808,6 +809,7 @@ class BoundedAgent:
     def route_and_plan(self, state: AgentState) -> dict[str, Any]:
         started = time.perf_counter()
         question = state["question"]
+        retrieval_query = state.get("retrieval_query", question)
         multi_query_requested = state.get("multi_query_requested", False)
         expansion_budget_available = (
             state.get("llm_calls", 0) + 4 <= self.limits.max_llm_calls
@@ -825,7 +827,7 @@ class BoundedAgent:
             return {
                 **update,
                 "plan": plan,
-                "search_queries": [question],
+                "search_queries": [retrieval_query],
                 "multi_query_status": status,
                 "multi_query_fallback_reason": (
                     "grounding_validation_budget_reserved"
@@ -906,6 +908,7 @@ class BoundedAgent:
             queries = [question]
             decision = "planner_fallback"
             errors.append({"node": "route_and_plan", "error": str(exc)})
+        queries = list(dict.fromkeys([retrieval_query, *queries[1:]]))
         generated_count = max(0, len(queries) - 1) if expansion_requested else 0
         multi_query_status = "disabled"
         fallback_reason = None
@@ -1085,7 +1088,7 @@ class BoundedAgent:
                 3,
             ) if requested else 0.0,
             "multi_query_queries": (
-                queries if expansion_active else ([state["question"]] if requested else [])
+                queries if expansion_active else ([queries[0]] if requested and queries else [])
             ),
         }
 
@@ -1588,14 +1591,17 @@ class BoundedAgent:
         request_id: str,
         *,
         multi_query_enabled: bool = False,
+        retrieval_query: str | None = None,
     ) -> AgentState:
+        effective_retrieval_query = retrieval_query or question
         initial: AgentState = {
             "request_id": request_id,
             "question": question,
+            "retrieval_query": effective_retrieval_query,
             "user_id": user_id,
             "session_id": session_id,
             "plan": [],
-            "search_queries": [question],
+            "search_queries": [effective_retrieval_query],
             "searched_queries": [],
             "evidence": [],
             "gaps": [],
@@ -1663,6 +1669,7 @@ def run_agent(
     agent: BoundedAgent | None = None,
     llm: LlmCaller | LlmSession | None = None,
     multi_query_enabled: bool = False,
+    retrieval_query: str | None = None,
 ) -> dict[str, Any]:
     if agent is None and llm is None:
         configured = get_settings()
@@ -1675,6 +1682,7 @@ def run_agent(
         session_id,
         request_id,
         multi_query_enabled=multi_query_enabled,
+        retrieval_query=retrieval_query,
     )
     retrieval_runs = state.get("retrieval_runs", [])
     rerank_latencies = [
@@ -1724,6 +1732,7 @@ def run_agent(
             "user_id": user_id,
             "session_id": session_id,
             "plan": state.get("plan", []),
+            "retrieval_query": state.get("retrieval_query", question),
             "search_queries": state.get("searched_queries", []),
             "source_ids": [source.get("chunk_id") for source in evidence],
             "document_security_flags": {

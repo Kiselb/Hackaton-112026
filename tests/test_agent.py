@@ -225,6 +225,50 @@ def test_simple_route_skips_planner():
     assert state["outcome"] == "answered"
 
 
+def test_retrieval_query_isolated_from_reasoning_question():
+    retriever, llm = Retriever(), ScriptedLlm()
+    original = "Кто назначает РП?"
+    expanded = "Кто назначает Руководителя проекта (РП)?"
+
+    state = agent(retriever, llm).invoke(
+        original,
+        "u",
+        "s",
+        "r",
+        retrieval_query=expanded,
+    )
+
+    assert state["question"] == original
+    assert state["retrieval_query"] == expanded
+    assert state["plan"] == [{"aspect_id": "aspect-1", "question": original}]
+    assert retriever.queries == [expanded]
+    assert all(expanded not in prompt for prompt in llm.calls)
+
+
+def test_retrieval_only_glossary_respects_multi_query_search_budget():
+    retriever, llm = Retriever(), ScriptedLlm()
+    original = "Сравни обязанности РП и SS по двум этапам проекта."
+    expanded = (
+        "Сравни обязанности Руководителя проекта (РП) и Solution Sales (SS) "
+        "по двум этапам проекта."
+    )
+
+    state = agent(retriever, llm, search_calls=3).invoke(
+        original,
+        "u",
+        "s",
+        "r",
+        multi_query_enabled=True,
+        retrieval_query=expanded,
+    )
+
+    planner_prompt = next(prompt for prompt in llm.calls if "Decompose" in prompt)
+    assert original in planner_prompt
+    assert expanded not in planner_prompt
+    assert retriever.queries[0] == expanded
+    assert state["search_calls"] <= 3
+
+
 def test_evidence_assessment_uses_schema_and_operation_output_budget():
     class StructuredLlm(ScriptedLlm):
         def __init__(self) -> None:

@@ -19,7 +19,8 @@ OpenSearch могут работать в Docker Desktop/WSL.
 - bounded AI-Агент по умолчанию с input guardrails, evidence assessment и fail-closed answer validation;
 - request-level Multi-Query для AI-Агента: безопасное query expansion, межзапросный RRF и прозрачные затраты;
 - опциональное детерминированное раскрытие сокращений из валидируемого локального
-  глоссария перед agent retrieval, без добавления evidence или поисковых вызовов;
+  глоссария только в `retrieval_query`: planning, clarification и validation продолжают
+  использовать неизменённый `resolved_query`, без добавления evidence или поисковых вызовов;
 - request-level выбор локального Ollama или OpenAI Responses API с единым LLM-интерфейсом;
 - stateful-уточнения с PostgreSQL-историей, повторным retrieval и изоляцией диалогов;
 - подтверждаемая пользователем эскалация в службу качества, безопасный SMTP и
@@ -89,7 +90,8 @@ Glossary-Aware Query Understanding выключен по умолчанию (`GL
 Приватный словарь загружается из `GLOSSARY_PATH`, целиком валидируется с SHA-256 и не
 становится источником ответа. Реальная A/B-оценка v1 показала смешанный retrieval-эффект
 и ухудшение answer-quality proxies, поэтому включение на публичном стенде не
-рекомендуется: [docs/CLIP018B_GLOSSARY.md](docs/CLIP018B_GLOSSARY.md).
+рекомендуется. Retrieval-only исправление также не прошло safety-gates:
+[docs/CLIP018B_FIX.md](docs/CLIP018B_FIX.md).
 
 LLM по умолчанию остаётся `ollama`/`qwen3.5:9b`. Опциональный OpenAI включается только
 backend-настройками, использует Responses API с `store=false` и серверный allowlist

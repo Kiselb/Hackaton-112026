@@ -59,8 +59,9 @@ question + user_id + session_id
     -> deterministic input guard (language, meaningfulness, scope, injection)
     -> AGENT_ENABLED=false: strict single-query RAG
     -> AGENT_ENABLED=true (default for new configs): LangGraph
-         -> optional deterministic glossary expansion of the current resolved query
-         route_and_plan (simple fast route or one bounded JSON plan)
+         -> preserve original_question and build the conversational resolved_query
+         -> optional deterministic glossary expansion into a separate retrieval_query
+         route_and_plan over resolved_query (simple fast route or one bounded JSON plan)
               -> optional request-level Multi-Query expansion in the same structured call
          -> retrieve per formulation (existing BGE-M3 + BM25 + RRF + SQL visibility + optional rerank)
               -> inter-query RRF + chunk_id deduplication when Multi-Query is effective
@@ -144,11 +145,15 @@ LangGraph recursion limit make it finite. State is request-local and is not long
 shared memory.
 
 Glossary-aware understanding is an independent deterministic preprocessing step after
-conversation/reference resolution and before planning. A validated private JSON maps
-whole-token aliases to approved expansions; ambiguous entries require declared lexical
-context. The retrieval form retains the acronym in parentheses, while the raw user text
-and pre-glossary `resolved_query` remain in the trace. The glossary is never evidence and
-adds no retrieval/LLM call. Invalid enabled configuration fails closed before search.
+conversation/reference resolution. A validated private JSON maps whole-token aliases to
+approved expansions; ambiguous entries require declared lexical context. The retrieval
+form retains the acronym in parentheses. `original_question`, the pre-glossary
+`resolved_query`, matched terminology and the separate `retrieval_query` remain in the
+trace. Planning, clarification, evidence assessment, answer composition and grounding
+validation use `resolved_query`; only search receives `retrieval_query`. The glossary is
+never evidence and adds no retrieval/LLM call. Invalid enabled configuration fails closed
+before search. `legacy_agent_query` exists only to reproduce CLIP-018B experiments; new
+configurations default to `retrieval_only`, while the feature itself remains disabled.
 
 The same turn-scoped LLM session is used for planning, evidence assessment, answer
 composition, citation repair and grounding validation. OpenAI uses the Responses API with

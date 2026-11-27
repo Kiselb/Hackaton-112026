@@ -173,6 +173,7 @@ def test_settings_keep_glossary_disabled_by_default():
     configured = Settings(_env_file=None)
     assert configured.glossary_enabled is False
     assert configured.glossary_path == Path("storage/glossary/customer_v1.json")
+    assert configured.glossary_mode == "retrieval_only"
 
 
 def agent_result(outcome: str = "answered") -> dict:
@@ -240,16 +241,19 @@ def test_agent_retrieval_receives_expanded_query_without_extra_search(
     glossary_path: Path,
     multi_query_enabled: bool,
 ):
-    seen: list[tuple[str, bool]] = []
+    seen: list[tuple[str, str, bool]] = []
 
     def run(question: str, *args, **kwargs):
-        seen.append((question, kwargs["multi_query_enabled"]))
+        seen.append(
+            (question, kwargs["retrieval_query"], kwargs["multi_query_enabled"])
+        )
         return agent_result()
 
     get_glossary_expander.cache_clear()
     monkeypatch.setattr(main.settings, "agent_enabled", True)
     monkeypatch.setattr(main.settings, "glossary_enabled", True)
     monkeypatch.setattr(main.settings, "glossary_path", glossary_path)
+    monkeypatch.setattr(main.settings, "glossary_mode", "retrieval_only")
     monkeypatch.setattr(main, "run_agent", run)
     db = FakeDb()
 
@@ -261,16 +265,72 @@ def test_agent_retrieval_receives_expanded_query_without_extra_search(
         db,
     )
 
-    assert "Заявка на пресейл (ЗНП)" in seen[0][0]
-    assert seen[0][1] is multi_query_enabled
+    assert seen[0][0] == "Кто утверждает ЗНП?"
+    assert "Заявка на пресейл (ЗНП)" in seen[0][1]
+    assert seen[0][2] is multi_query_enabled
     assert result["metrics"]["agent_search_calls"] == 1
     assert result["metrics"]["glossary_used"] is True
     assert result["metrics"]["glossary_applied_expansions"] == 1
     assert result["metrics"]["glossary_additional_retrieval_calls"] == 0
     assert db.trace.question == "Кто утверждает ЗНП?"
     assert db.trace.details["glossary_used"] is True
-    assert db.trace.details["glossary_search_query"] == seen[0][0]
+    assert db.trace.details["resolved_query"] == seen[0][0]
+    assert db.trace.details["retrieval_query"] == seen[0][1]
+    assert db.trace.details["glossary_search_query"] == seen[0][1]
+    assert db.trace.details["glossary_matches"] == [
+        {
+            "abbreviation": "ЗНП",
+            "expansion": "Заявка на пресейл",
+            "status": "applied",
+        }
+    ]
     assert all(source["source_type"] == "corporate_document" for source in result["sources"])
+    assert all(source.get("source_type") != "glossary" for source in result["sources"])
+
+
+def test_question_without_abbreviation_keeps_reasoning_and_retrieval_identical(
+    monkeypatch: pytest.MonkeyPatch, glossary_path: Path
+):
+    seen: list[tuple[str, str]] = []
+
+    def run(question: str, *args, **kwargs):
+        seen.append((question, kwargs["retrieval_query"]))
+        return agent_result()
+
+    get_glossary_expander.cache_clear()
+    monkeypatch.setattr(main.settings, "agent_enabled", True)
+    monkeypatch.setattr(main.settings, "glossary_enabled", True)
+    monkeypatch.setattr(main.settings, "glossary_path", glossary_path)
+    monkeypatch.setattr(main.settings, "glossary_mode", "retrieval_only")
+    monkeypatch.setattr(main, "run_agent", run)
+
+    result = main.ask(main.AskRequest(question="Кто утверждает договор?"), FakeDb())
+
+    assert seen == [("Кто утверждает договор?", "Кто утверждает договор?")]
+    assert result["metrics"]["glossary_used"] is False
+    assert result["metrics"]["agent_search_calls"] == 1
+
+
+def test_legacy_mode_reproduces_expanded_agent_question(
+    monkeypatch: pytest.MonkeyPatch, glossary_path: Path
+):
+    seen: list[tuple[str, str]] = []
+
+    def run(question: str, *args, **kwargs):
+        seen.append((question, kwargs["retrieval_query"]))
+        return agent_result()
+
+    get_glossary_expander.cache_clear()
+    monkeypatch.setattr(main.settings, "agent_enabled", True)
+    monkeypatch.setattr(main.settings, "glossary_enabled", True)
+    monkeypatch.setattr(main.settings, "glossary_path", glossary_path)
+    monkeypatch.setattr(main.settings, "glossary_mode", "legacy_agent_query")
+    monkeypatch.setattr(main, "run_agent", run)
+
+    main.ask(main.AskRequest(question="Кто утверждает ЗНП?"), FakeDb())
+
+    assert seen[0][0] == seen[0][1]
+    assert "Заявка на пресейл (ЗНП)" in seen[0][0]
 
 
 def test_missing_enabled_glossary_stops_before_retrieval(monkeypatch, tmp_path: Path):
@@ -298,16 +358,17 @@ def test_glossary_applies_to_resolved_clarification_query(
 ):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
-    seen: list[str] = []
+    seen: list[tuple[str, str]] = []
 
     def run(question: str, *args, **kwargs):
-        seen.append(question)
+        seen.append((question, kwargs["retrieval_query"]))
         return agent_result("clarification_required" if len(seen) == 1 else "answered")
 
     get_glossary_expander.cache_clear()
     monkeypatch.setattr(main.settings, "agent_enabled", True)
     monkeypatch.setattr(main.settings, "glossary_enabled", True)
     monkeypatch.setattr(main.settings, "glossary_path", glossary_path)
+    monkeypatch.setattr(main.settings, "glossary_mode", "retrieval_only")
     monkeypatch.setattr(main, "run_agent", run)
     with Session(engine, expire_on_commit=False) as db:
         response = Response()
@@ -328,8 +389,10 @@ def test_glossary_applies_to_resolved_clarification_query(
         traces = list(db.scalars(select(SearchTrace).order_by(SearchTrace.created_at)))
 
     assert second["outcome"] == "answered"
-    assert "Заявка на пресейл (ЗНП)" in seen[1]
-    assert "Дирекция информационной безопасности (ДИБ)" in seen[1]
+    assert "Заявка на пресейл (ЗНП)" not in seen[1][0]
+    assert "Дирекция информационной безопасности (ДИБ)" not in seen[1][0]
+    assert "Заявка на пресейл (ЗНП)" in seen[1][1]
+    assert "Дирекция информационной безопасности (ДИБ)" in seen[1][1]
     assert traces[1].details["original_question"] == "Кто утверждает ЗНП?"
     assert "Уточнённые пользователем условия" in traces[1].details["resolved_query"]
     assert "Заявка на пресейл (ЗНП)" not in traces[1].details["resolved_query"]

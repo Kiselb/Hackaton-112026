@@ -708,6 +708,12 @@ def ask(
                 **_conversation_trace_details(
                     conversation, user_turn, resolved_question
                 ),
+                "original_question": (
+                    conversation.original_question
+                    if conversation is not None
+                    else payload.question
+                ),
+                "resolved_query": resolved_question,
                 **multi_query_trace_defaults,
                 **disabled_expansion(resolved_question).trace_details(),
                 "glossary_enabled": True,
@@ -740,12 +746,22 @@ def ask(
                 issued_token=issued_token,
                 preserve_awaiting=clarification_follow_up,
             )
-    effective_question = glossary_expansion.search_query
+    retrieval_question = glossary_expansion.search_query
+    legacy_glossary_mode = (
+        glossary_expansion.used and settings.glossary_mode == "legacy_agent_query"
+    )
+    effective_question = retrieval_question if legacy_glossary_mode else resolved_question
     conversation_details = {
         **_conversation_trace_details(conversation, user_turn, resolved_question),
+        "original_question": (
+            conversation.original_question if conversation is not None else payload.question
+        ),
+        "resolved_query": resolved_question,
         **multi_query_trace_defaults,
         **glossary_expansion.trace_details(),
         "glossary_status": "applied" if glossary_expansion.used else "no_change",
+        "glossary_mode": settings.glossary_mode,
+        "retrieval_query": retrieval_question,
     }
     if input_assessment is not None and not input_assessment.allowed:
         result = _finish_controlled(
@@ -885,6 +901,7 @@ def ask(
                 str(trace.id),
                 llm=llm,
                 multi_query_enabled=multi_query_requested,
+                retrieval_query=retrieval_question,
             )
         except Exception as exc:
             controlled = _finish_controlled(
