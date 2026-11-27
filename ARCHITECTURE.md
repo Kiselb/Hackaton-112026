@@ -86,17 +86,22 @@ new agent question -> processing -> answered -> completed
                                       -> guarded short answer -> processing
                                       -> fresh LangGraph + fresh retrieval + strict validation
                                       -> awaiting_clarification | completed
+completed -> new independent question -> processing
+          -> fresh LangGraph + fresh retrieval -> awaiting_clarification | completed
 awaiting_clarification -> close -> closed
-awaiting_clarification -> TTL -> expired
+completed | awaiting_clarification -> TTL -> expired
 ```
 
 Продолжение требует `conversation_id` и заголовок `X-Conversation-Token`; в БД хранится
 только SHA-256-хеш, сравнение выполняется constant-time. `SELECT ... FOR UPDATE` и
 промежуточный статус `processing` не позволяют двум follow-up раздвоить состояние.
-Контекст формируется как bounded `resolved_query`: исходный вопрос остаётся отдельным,
-уточнения помечены как пользовательские условия, а не корпоративные факты. Каждый ход
-заново проходит SQL visibility gate, поэтому прежние source IDs и деактивированный между
-ходами документ не подтверждают итоговый ответ.
+Контекст уточнения формируется как bounded `resolved_query`: активный вопрос остаётся
+отдельным, уточнения помечены как пользовательские условия, а не корпоративные факты.
+После `completed` новый вопрос сохраняется новым turn и обнуляет только счётчики активного
+вопроса. Для ссылочного вопроса используется только последний bounded-обмен с явной
+маркировкой «контекст, не evidence»; неоднозначная ссылка требует уточнения. Каждый ход
+заново проходит SQL visibility gate, поэтому прежние ответы/source IDs и деактивированный
+между ходами документ не подтверждают новый ответ.
 
 Baseline RAG не продолжает ожидающий agent dialogue. Provider/model фиксируются новым
 `LlmSession` только на текущий ход; между ходами пользователь может явно изменить модель,

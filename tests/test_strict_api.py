@@ -83,6 +83,24 @@ def test_capabilities_publish_only_safe_multi_query_configuration(monkeypatch):
     }
 
 
+def test_capabilities_publish_actual_agent_default_and_demo_override(monkeypatch):
+    monkeypatch.setattr(main.settings, "agent_enabled", True)
+    monkeypatch.setattr(main.settings, "agent_demo_override_enabled", True)
+    monkeypatch.setattr(main.settings, "multi_query_default_enabled", False)
+
+    result = main.capabilities()
+
+    assert result["default_mode"] == "agent"
+    assert result["agent_demo_override_enabled"] is True
+    assert result["multi_query"]["default_enabled"] is False
+
+
+def test_capabilities_do_not_hide_backend_baseline_configuration(monkeypatch):
+    monkeypatch.setattr(main.settings, "agent_enabled", False)
+
+    assert main.capabilities()["default_mode"] == "baseline"
+
+
 def test_baseline_explicitly_rejects_multi_query(monkeypatch):
     monkeypatch.setattr(main.settings, "agent_demo_override_enabled", True)
     monkeypatch.setattr(main.settings, "multi_query_enabled", True)

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from clip_agent import main
 from clip_agent.conversations import CONVERSATION_TOKEN_HEADER, hash_owner_token
-from clip_agent.db import Base, Conversation, SearchTrace, utcnow
+from clip_agent.db import Base, Conversation, ConversationTurn, SearchTrace, utcnow
 
 
 def agent_result(
@@ -93,6 +93,26 @@ def start_dialogue(monkeypatch: pytest.MonkeyPatch, db: Session) -> tuple[dict, 
     return result, response.headers[CONVERSATION_TOKEN_HEADER]
 
 
+def start_answered_dialogue(
+    monkeypatch: pytest.MonkeyPatch, db: Session, question: str = "Кто утверждает регламент?"
+) -> tuple[dict, str]:
+    monkeypatch.setattr(main.settings, "agent_enabled", True)
+    monkeypatch.setattr(
+        main,
+        "run_agent",
+        lambda *args, **kwargs: agent_result(
+            "answered", "Регламент утверждает директор [1].", source_id="chunk-1"
+        ),
+    )
+    response = Response()
+    result = main.ask(
+        main.AskRequest(question=question, user_id="user-a", session_id="tab-a"),
+        db,
+        response=response,
+    )
+    return result, response.headers[CONVERSATION_TOKEN_HEADER]
+
+
 def test_ambiguous_question_creates_hashed_owned_dialogue(monkeypatch, db: Session):
     result, token = start_dialogue(monkeypatch, db)
 
@@ -137,6 +157,200 @@ def test_short_clarification_repeats_retrieval_and_completes(monkeypatch, db: Se
     assert "Кто назначает руководителя проекта?" in seen_questions[0]
     assert "Пресейл" in seen_questions[0]
     assert len(db.scalars(select(SearchTrace)).all()) == 2
+
+
+def test_completed_dialogue_accepts_multiple_independent_questions(monkeypatch, db):
+    first, token = start_answered_dialogue(monkeypatch, db)
+    conversation_id = UUID(first["conversation_id"])
+    seen_questions: list[str] = []
+
+    def answer(question: str, *args, **kwargs):
+        seen_questions.append(question)
+        return agent_result("answered", "Срок составляет пять дней [1].", source_id="chunk-2")
+
+    monkeypatch.setattr(main, "run_agent", answer)
+    second = main.ask(
+        main.AskRequest(
+            question="Какой срок согласования?",
+            conversation_id=conversation_id,
+            user_id="user-a",
+            session_id="tab-a",
+        ),
+        db,
+        conversation_token=token,
+    )
+    third = main.ask(
+        main.AskRequest(
+            question="Кто контролирует исполнение?",
+            conversation_id=conversation_id,
+            user_id="user-a",
+            session_id="tab-a",
+        ),
+        db,
+        conversation_token=token,
+    )
+
+    assert second["conversation_id"] == first["conversation_id"]
+    assert third["conversation_id"] == first["conversation_id"]
+    assert second["conversation_status"] == third["conversation_status"] == "completed"
+    assert seen_questions == ["Какой срок согласования?", "Кто контролирует исполнение?"]
+    turns = db.scalars(
+        select(ConversationTurn)
+        .where(ConversationTurn.conversation_id == conversation_id)
+        .order_by(ConversationTurn.ordinal)
+    ).all()
+    assert [turn.kind for turn in turns] == [
+        "original_question",
+        "final_answer",
+        "new_question",
+        "final_answer",
+        "new_question",
+        "final_answer",
+    ]
+    assert len({turn.trace_id for turn in turns if turn.role == "assistant"}) == 3
+
+
+def test_completed_history_can_be_reloaded_and_continued(monkeypatch, db):
+    first, token = start_answered_dialogue(monkeypatch, db)
+    conversation_id = UUID(first["conversation_id"])
+    reloaded = main.conversation_history(conversation_id, token, db)
+
+    assert reloaded["status"] == "completed"
+    assert [turn["content"] for turn in reloaded["turns"]] == [
+        "Кто утверждает регламент?",
+        "Регламент утверждает директор [1].",
+    ]
+    monkeypatch.setattr(
+        main,
+        "run_agent",
+        lambda *args, **kwargs: agent_result(
+            "answered", "Контроль выполняет служба качества [1].", source_id="chunk-2"
+        ),
+    )
+    continued = main.ask(
+        main.AskRequest(
+            question="Кто контролирует исполнение?", conversation_id=conversation_id
+        ),
+        db,
+        conversation_token=token,
+    )
+    assert continued["conversation_status"] == "completed"
+    assert len(main.conversation_history(conversation_id, token, db)["turns"]) == 4
+
+
+def test_mode_switch_cannot_silently_change_existing_agent_dialogue(monkeypatch, db):
+    first, token = start_answered_dialogue(monkeypatch, db)
+    conversation_id = UUID(first["conversation_id"])
+    monkeypatch.setattr(main.settings, "agent_demo_override_enabled", True)
+
+    with pytest.raises(HTTPException) as error:
+        main.ask(
+            main.AskRequest(
+                question="Какой срок согласования?",
+                conversation_id=conversation_id,
+                mode="baseline",
+            ),
+            db,
+            conversation_token=token,
+        )
+
+    assert error.value.status_code == 409
+    assert len(main.conversation_history(conversation_id, token, db)["turns"]) == 2
+
+
+def test_new_question_after_clarified_answer_resets_only_clarification_counters(
+    monkeypatch, db
+):
+    first, token = start_dialogue(monkeypatch, db)
+    conversation_id = UUID(first["conversation_id"])
+    monkeypatch.setattr(
+        main,
+        "run_agent",
+        lambda *args, **kwargs: agent_result(
+            "answered", "Руководителя назначает директор [1].", source_id="chunk-1"
+        ),
+    )
+    clarified = main.ask(
+        main.AskRequest(question="Пресейл", conversation_id=conversation_id),
+        db,
+        conversation_token=token,
+    )
+    assert clarified["conversation_status"] == "completed"
+    assert db.get(Conversation, conversation_id).clarification_count == 1
+
+    monkeypatch.setattr(
+        main,
+        "run_agent",
+        lambda *args, **kwargs: agent_result(
+            "clarification_required",
+            "Уточните тип договора?",
+            reason_code="ambiguous_scope",
+            source_id="chunk-2",
+        ),
+    )
+    next_question = main.ask(
+        main.AskRequest(
+            question="Кто согласует договор?", conversation_id=conversation_id
+        ),
+        db,
+        conversation_token=token,
+    )
+    conversation = db.get(Conversation, conversation_id)
+    assert next_question["conversation_status"] == "awaiting_clarification"
+    assert conversation.clarification_count == 1
+    assert conversation.user_answer_count == 0
+    assert len(main.conversation_history(conversation_id, token, db)["turns"]) == 6
+
+
+def test_referential_question_uses_only_bounded_previous_exchange(monkeypatch, db):
+    first, token = start_answered_dialogue(
+        monkeypatch, db, question="Кто готовит регламент закупок?"
+    )
+    seen: list[str] = []
+
+    def answer(question: str, *args, **kwargs):
+        seen.append(question)
+        return agent_result("answered", "Его утверждает директор [1].", source_id="chunk-2")
+
+    monkeypatch.setattr(main, "run_agent", answer)
+    result = main.ask(
+        main.AskRequest(
+            question="А кто его утверждает?",
+            conversation_id=UUID(first["conversation_id"]),
+        ),
+        db,
+        conversation_token=token,
+    )
+
+    assert result["conversation_status"] == "completed"
+    assert "Кто готовит регламент закупок?" in seen[0]
+    assert "не доказательство корпоративных фактов" in seen[0]
+    assert len(seen[0]) < main.settings.conversation_max_context_chars + 1000
+
+
+def test_ambiguous_referential_question_requests_clarification_without_agent(
+    monkeypatch, db
+):
+    first, token = start_answered_dialogue(
+        monkeypatch, db, question="Чем отличаются приказ и регламент?"
+    )
+    monkeypatch.setattr(
+        main,
+        "run_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("agent called")),
+    )
+    result = main.ask(
+        main.AskRequest(
+            question="А кто его утверждает?",
+            conversation_id=UUID(first["conversation_id"]),
+        ),
+        db,
+        conversation_token=token,
+    )
+
+    assert result["outcome"] == "clarification_required"
+    assert result["reason_code"] == "unresolved_conversation_reference"
+    assert result["conversation_status"] == "awaiting_clarification"
 
 
 def test_partial_clarification_is_bounded_to_two_questions(monkeypatch, db: Session):
@@ -286,10 +500,12 @@ def test_new_question_during_clarification_requires_new_dialogue(monkeypatch, db
             conversation_token=token,
         )
     assert error.value.status_code == 409
-    assert "Новый диалог" in error.value.detail
+    assert "начните новый диалог" in error.value.detail
 
 
-def test_conflict_after_clarification_is_preserved(monkeypatch, db):
+def test_conflict_after_clarification_is_preserved_and_dialogue_can_continue(
+    monkeypatch, db
+):
     first, token = start_dialogue(monkeypatch, db)
     monkeypatch.setattr(
         main,
@@ -312,13 +528,19 @@ def test_conflict_after_clarification_is_preserved(monkeypatch, db):
 
     assert result["outcome"] == "conflict_detected"
     assert result["conversation_status"] == "completed"
-    with pytest.raises(HTTPException) as completed:
-        main.ask(
-            main.AskRequest(
-                question="Реализация",
-                conversation_id=UUID(first["conversation_id"]),
-            ),
-            db,
-            conversation_token=token,
-        )
-    assert completed.value.status_code == 409
+    monkeypatch.setattr(
+        main,
+        "run_agent",
+        lambda *args, **kwargs: agent_result(
+            "answered", "Новый ответ подтверждён [1].", source_id="chunk-2"
+        ),
+    )
+    continued = main.ask(
+        main.AskRequest(
+            question="Какой срок оплаты?",
+            conversation_id=UUID(first["conversation_id"]),
+        ),
+        db,
+        conversation_token=token,
+    )
+    assert continued["conversation_status"] == "completed"

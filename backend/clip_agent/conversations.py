@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -74,6 +75,7 @@ def lock_conversation(
     token: str | None,
     *,
     expected_status: str | None = None,
+    allowed_statuses: tuple[str, ...] | None = None,
 ) -> Conversation:
     conversation = db.scalar(
         select(Conversation).where(Conversation.id == conversation_id).with_for_update()
@@ -90,7 +92,10 @@ def lock_conversation(
             "Срок действия диалога истёк. Начните новый диалог.",
             "conversation_expired",
         )
-    if expected_status and conversation.status != expected_status:
+    accepted_statuses = allowed_statuses or (
+        (expected_status,) if expected_status is not None else None
+    )
+    if accepted_statuses and conversation.status not in accepted_statuses:
         if conversation.status == "processing":
             raise ConversationAccessError(
                 409,
@@ -100,7 +105,7 @@ def lock_conversation(
         raise ConversationAccessError(
             409,
             "Этот диалог нельзя продолжить. Начните новый диалог.",
-            "conversation_not_awaiting_clarification",
+            "conversation_not_continuable",
         )
     return conversation
 
@@ -176,6 +181,90 @@ def resolved_query(conversation: Conversation) -> str:
         f"Уточнённые пользователем условия (контекст запроса, не корпоративные факты): "
         f"{conditions}"
     )
+
+
+_REFERENCE_MARKER = re.compile(
+    r"\b(?:его|её|ее|их|он|она|они|этот|эта|это|эти|такой|такая|такие|"
+    r"указанн\w*|названн\w*|упомянут\w*)\b",
+    re.IGNORECASE,
+)
+_DOCUMENT_OBJECT = re.compile(
+    r"\b(?:регламент|приказ|положени|политик|инструкци|договор|документ|"
+    r"заявк|лицензи|процедур)\w*\b",
+    re.IGNORECASE,
+)
+
+
+def is_referential_question(question: str) -> bool:
+    return bool(_REFERENCE_MARKER.search(" ".join(question.split())))
+
+
+def bounded_reference_context(
+    db: Session,
+    conversation: Conversation,
+    *,
+    max_context_chars: int,
+) -> str | None:
+    """Return only the latest completed question exchange for pronoun resolution.
+
+    The returned text is conversational context, never evidence. A chained reference or
+    two distinct document-like objects is treated as ambiguous instead of being guessed.
+    """
+    root_turn = db.scalar(
+        select(ConversationTurn)
+        .where(
+            ConversationTurn.conversation_id == conversation.id,
+            ConversationTurn.role == "user",
+            ConversationTurn.kind.in_(("original_question", "new_question")),
+        )
+        .order_by(ConversationTurn.ordinal.desc())
+        .limit(1)
+    )
+    if root_turn is None or is_referential_question(root_turn.content):
+        return None
+    document_objects = {
+        match.group(0).casefold() for match in _DOCUMENT_OBJECT.finditer(root_turn.content)
+    }
+    if len(document_objects) > 1:
+        return None
+
+    turns = list(
+        db.scalars(
+            select(ConversationTurn)
+            .where(
+                ConversationTurn.conversation_id == conversation.id,
+                ConversationTurn.ordinal >= root_turn.ordinal,
+            )
+            .order_by(ConversationTurn.ordinal)
+        ).all()
+    )
+    labels = {"user": "Пользователь", "assistant": "Предыдущий ответ системы"}
+    lines = [f"{labels.get(turn.role, turn.role)}: {' '.join(turn.content.split())}" for turn in turns]
+    if not lines:
+        return None
+
+    root_line = lines[0][:max_context_chars]
+    selected = [root_line]
+    remaining = max_context_chars - len(root_line)
+    for line in reversed(lines[1:]):
+        if remaining <= 2:
+            break
+        excerpt = line[: remaining - 2]
+        selected.insert(1, excerpt)
+        remaining -= len(excerpt) + 2
+    return "\n".join(selected)
+
+
+def begin_new_question(conversation: Conversation, question: str) -> None:
+    """Start an independent question while retaining immutable conversation turns."""
+    conversation.original_question = question
+    conversation.pending_clarification = None
+    conversation.clarification_context = {"answers": []}
+    conversation.clarification_count = 0
+    conversation.user_answer_count = 0
+    conversation.status = "processing"
+    conversation.version += 1
+    conversation.updated_at = utcnow()
 
 
 def serialize_conversation(conversation: Conversation) -> dict[str, Any]:

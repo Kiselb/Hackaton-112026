@@ -3,6 +3,7 @@ from __future__ import annotations
 import smtplib
 from datetime import timedelta
 from types import SimpleNamespace
+from uuid import UUID
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import create_engine, inspect, select
@@ -74,6 +75,9 @@ def seed_escalation(db: Session, *, outcome: str = "quality_review_required") ->
             "outcome": outcome,
             "reason_code": "no_evidence",
             "conversation_id": str(conversation.id),
+            "original_question": conversation.original_question,
+            "clarification_answers": ["Для тестового подразделения"],
+            "clarification_count": 1,
         },
     )
     db.add(trace)
@@ -128,6 +132,7 @@ def test_request_requires_eligible_owned_trace_and_is_idempotent(db, app_setting
     assert repeated_created is False
     assert repeated.id == request.id
     assert request.email_status == "not_requested"
+    assert request.clarification_context["answers"] == ["Для тестового подразделения"]
     assert len(db.scalars(select(QualityRequest)).all()) == 1
     with pytest.raises(quality.QualityServiceError) as denied_repeat:
         quality.create_quality_request(
@@ -138,6 +143,26 @@ def test_request_requires_eligible_owned_trace_and_is_idempotent(db, app_setting
             settings=app_settings,
         )
     assert denied_repeat.value.status_code == 404
+
+
+def test_request_for_previous_trace_keeps_that_turn_question(db, app_settings):
+    trace, token = seed_escalation(db)
+    conversation = db.get(Conversation, UUID(trace.details["conversation_id"]))
+    conversation.original_question = "Более поздний вопрос того же диалога"
+    conversation.clarification_context = {"answers": []}
+    db.commit()
+
+    request, created = quality.create_quality_request(
+        db,
+        trace_id=trace.id,
+        idempotency_key="idem-quality-previous-turn",
+        conversation_token=token,
+        settings=app_settings,
+    )
+
+    assert created is True
+    assert request.question == "Как оформить синтетическую заявку?"
+    assert request.clarification_context["answers"] == ["Для тестового подразделения"]
 
 
 def test_wrong_conversation_token_and_technical_error_are_blocked(db, app_settings):

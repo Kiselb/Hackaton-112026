@@ -205,10 +205,23 @@ type ChatMessage = {
 type ConversationHistory = {
   conversation_id: string;
   status: ConversationStatus;
+  mode: Mode;
   pending_clarification: string | null;
   expires_at: string;
   turns: Array<ChatMessage & {ordinal: number}>;
 };
+
+function canSubmitConversation(busy: boolean, status: ConversationStatus | null) {
+  return !busy && status !== "processing" && status !== "closed" && status !== "expired";
+}
+
+function userTurnKind(
+  conversationId: string | null,
+  status: ConversationStatus | null,
+) {
+  if (!conversationId) return "original_question";
+  return status === "awaiting_clarification" ? "clarification_answer" : "new_question";
+}
 
 type LlmProviderCapability = {
   id: LlmProvider;
@@ -524,9 +537,9 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
         sources: turn.sources ?? [],
       })));
       setConversationStatus(history.status);
+      if (history.mode === "agent") setRequestedMode("agent");
       if (history.status === "awaiting_clarification") {
         setQuestion("");
-        setRequestedMode("agent");
       }
     }).catch((reason) => {
       sessionStorage.removeItem("clip-conversation-id");
@@ -554,6 +567,7 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
     if (!content) return;
     const submissionKey = `${conversationId ?? "new"}:${content}`;
     if (busy || submissionKey === lastSubmission.current) return;
+    const submittedTurnKind = userTurnKind(conversationId, conversationStatus);
     lastSubmission.current = submissionKey;
     setBusy(true);
     setError("");
@@ -592,7 +606,7 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
       if (result.awaiting_clarification) setRequestedMode("agent");
       setMessages((current) => [
         ...current,
-        {id: crypto.randomUUID(), role: "user", kind: conversationId ? "clarification_answer" : "original_question", content, sources: []},
+        {id: crypto.randomUUID(), role: "user", kind: submittedTurnKind, content, sources: []},
         {
           id: result.turn_id ?? crypto.randomUUID(),
           role: "assistant",
@@ -648,6 +662,8 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
     setConversationStatus(null);
     setMessages([]);
     setQuestion("");
+    setRequestedMode(capabilities.default_mode);
+    setMultiQueryEnabled(capabilities.multi_query.default_enabled);
     setError("");
     lastSubmission.current = "";
   }
@@ -656,7 +672,7 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
   const agentMode = (
     capabilities.agent_demo_override_enabled ? requestedMode : capabilities.default_mode
   ) === "agent";
-  const canSubmit = !busy && conversationStatus !== "closed" && conversationStatus !== "completed";
+  const canSubmit = canSubmitConversation(busy, conversationStatus);
   return <section className="stack">
     <form className="panel ask" onSubmit={submitQuestion}>
       <div className="form-heading">
@@ -677,7 +693,7 @@ function SearchView({capabilities}: {capabilities: Capabilities}) {
             </select>
           </label>}
           {capabilities.agent_demo_override_enabled ? <label className="mode-select">Режим
-            <select disabled={awaiting} value={requestedMode} onChange={(event) => setRequestedMode(event.target.value as Mode)}>
+            <select disabled={Boolean(conversationId)} value={requestedMode} onChange={(event) => setRequestedMode(event.target.value as Mode)}>
               <option value="baseline">Базовый RAG</option>
               <option value="agent">AI-Агент</option>
             </select>

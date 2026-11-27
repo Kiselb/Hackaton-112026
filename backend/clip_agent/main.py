@@ -41,7 +41,11 @@ from .conversations import (
     ConversationAccessError,
     add_turn,
     append_clarification,
+    begin_new_question,
+    bounded_reference_context,
+    clarification_answers,
     create_conversation,
+    is_referential_question,
     lock_conversation,
     resolved_query,
     serialize_conversation,
@@ -537,7 +541,7 @@ def ask(
     if payload.conversation_id is not None and not use_agent:
         raise HTTPException(
             409,
-            "Диалог с ожидаемым уточнением можно продолжить только в режиме AI-Агента.",
+            "Существующий диалог можно продолжить только в режиме AI-Агента.",
         )
 
     started = time.perf_counter()
@@ -546,7 +550,10 @@ def ask(
     user_turn: ConversationTurn | None = None
     effective_question = payload.question
     follow_up = payload.conversation_id is not None
+    clarification_follow_up = False
     clarification_assessment = None
+    reference_context: str | None = None
+    unresolved_reference = False
 
     if follow_up:
         if not isinstance(db, Session):
@@ -556,22 +563,31 @@ def ask(
                 db,
                 payload.conversation_id,
                 conversation_token,
-                expected_status="awaiting_clarification",
+                allowed_statuses=("awaiting_clarification", "completed"),
             )
         except ConversationAccessError as exc:
             raise HTTPException(exc.status_code, detail=str(exc)) from exc
         if len(payload.question) > settings.conversation_max_message_chars:
-            raise HTTPException(422, "Ответ на уточнение превышает допустимую длину.")
-        clarification_assessment = assess_clarification_answer(
-            payload.question,
-            original_question=conversation.original_question,
-            clarification_question=conversation.pending_clarification or "",
-        )
-        if clarification_assessment.likely_new_question:
-            raise HTTPException(
-                409,
-                "Похоже, это новый вопрос. Используйте кнопку «Новый диалог».",
+            raise HTTPException(422, "Сообщение превышает допустимую длину.")
+        clarification_follow_up = conversation.status == "awaiting_clarification"
+        if clarification_follow_up:
+            clarification_assessment = assess_clarification_answer(
+                payload.question,
+                original_question=conversation.original_question,
+                clarification_question=conversation.pending_clarification or "",
             )
+            if clarification_assessment.likely_new_question:
+                raise HTTPException(
+                    409,
+                    "Сначала ответьте на уточнение или начните новый диалог.",
+                )
+        elif is_referential_question(payload.question):
+            reference_context = bounded_reference_context(
+                db,
+                conversation,
+                max_context_chars=settings.conversation_max_context_chars,
+            )
+            unresolved_reference = reference_context is None
 
     trace = SearchTrace(
         question=payload.question, user_id=payload.user_id, session_id=payload.session_id
@@ -582,10 +598,12 @@ def ask(
     else:
         db.commit()
     mode = "langgraph_agent" if use_agent else "baseline"
-    input_assessment = (
-        None if follow_up else assess_input(payload.question)
-    )
-    if input_assessment is not None and not input_assessment.allowed:
+    input_assessment = None if clarification_follow_up else assess_input(payload.question)
+    if (
+        input_assessment is not None
+        and not input_assessment.allowed
+        and conversation is None
+    ):
         return _finish_controlled(
             db,
             trace,
@@ -619,7 +637,7 @@ def ask(
                 llm_provider=selection.provider,
                 llm_model=selection.model,
             )
-        else:
+        elif clarification_follow_up:
             user_turn = add_turn(
                 db,
                 conversation,
@@ -645,12 +663,82 @@ def ask(
                 conversation.status = "processing"
                 conversation.version += 1
                 conversation.updated_at = utcnow()
+        else:
+            begin_new_question(conversation, payload.question)
+            user_turn = add_turn(
+                db,
+                conversation,
+                role="user",
+                kind="new_question",
+                content=payload.question,
+                trace_id=trace.id,
+                llm_provider=selection.provider,
+                llm_model=selection.model,
+            )
+            if reference_context is not None:
+                effective_question = (
+                    f"Текущий вопрос: {payload.question}\n"
+                    "Ограниченный контекст предыдущего обмена (только для разрешения "
+                    "ссылки, не доказательство корпоративных фактов):\n"
+                    f"{reference_context}\n"
+                    "Если объект ссылки нельзя установить однозначно, запроси уточнение. "
+                    "Любой фактический ответ подтверждай только новым поиском по документам."
+                )
         db.commit()
 
     conversation_details = {
         **_conversation_trace_details(conversation, user_turn, effective_question),
         **multi_query_trace_defaults,
     }
+    if input_assessment is not None and not input_assessment.allowed:
+        result = _finish_controlled(
+            db,
+            trace,
+            started,
+            mode=mode,
+            outcome=input_assessment.outcome or "invalid_input",
+            reason_code=input_assessment.reason_code or "invalid_input",
+            answer=input_assessment.message or "Запрос не может быть обработан.",
+            agent_enabled=True,
+            details={**conversation_details, "input_guard": "rejected"},
+            llm=llm,
+        )
+        return _finalize_conversation_result(
+            db,
+            conversation,
+            trace,
+            result,
+            selection.provider,
+            selection.model,
+            response=response,
+            issued_token=issued_token,
+        )
+    if unresolved_reference:
+        result = _finish_controlled(
+            db,
+            trace,
+            started,
+            mode=mode,
+            outcome="clarification_required",
+            reason_code="unresolved_conversation_reference",
+            answer=(
+                "Уточните, пожалуйста, к какому документу, роли или объекту относится "
+                "ваш вопрос?"
+            ),
+            agent_enabled=True,
+            details={**conversation_details, "reference_context": "ambiguous"},
+            llm=llm,
+        )
+        return _finalize_conversation_result(
+            db,
+            conversation,
+            trace,
+            result,
+            selection.provider,
+            selection.model,
+            response=response,
+            issued_token=issued_token,
+        )
     if clarification_assessment and not clarification_assessment.allowed:
         result = _finish_controlled(
             db,
@@ -770,7 +858,7 @@ def ask(
                 selection.model,
                 response=response,
                 issued_token=issued_token,
-                preserve_awaiting=follow_up,
+                preserve_awaiting=clarification_follow_up,
             )
         latency_ms = round((time.perf_counter() - started) * 1000)
         sources = result["sources"]
@@ -871,7 +959,7 @@ def ask(
             selection.model,
             response=response,
             issued_token=issued_token,
-            preserve_awaiting=follow_up and outcome == "technical_error",
+            preserve_awaiting=clarification_follow_up and outcome == "technical_error",
         )
 
     return _run_baseline(payload, db, trace, started, llm)
@@ -889,6 +977,7 @@ def _conversation_trace_details(
         "conversation_turn": turn.ordinal if turn else None,
         "original_question": conversation.original_question,
         "resolved_query": resolved_question,
+        "clarification_answers": clarification_answers(conversation),
         "clarification_count": conversation.clarification_count,
         "clarification_answer_count": conversation.user_answer_count,
     }
